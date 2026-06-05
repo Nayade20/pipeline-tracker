@@ -16,12 +16,14 @@ from openpyxl.chart import BarChart, Reference
 # CONFIGURACIÓN — pon aquí tu API Key
 # ─────────────────────────────────────────────
 
-# Lee la API Key desde Streamlit Secrets (cloud) o directamente (local)
+# Lee la API Key y contraseña desde Streamlit Secrets (cloud) o directamente (local)
 import streamlit as _st
 try:
     HUBSPOT_API_KEY = _st.secrets["HUBSPOT_API_KEY"]
+    APP_PASSWORD    = _st.secrets["APP_PASSWORD"]
 except Exception:
-    HUBSPOT_API_KEY = "pat-eu1-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # ← solo para uso local
+    HUBSPOT_API_KEY = "pat-eu1-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    APP_PASSWORD    = ""  # sin contraseña en local
 
 OUTPUT_DIR = r"C:\Users\Administracion1\Zentralcom\Zentralcom S.L - Documentos\Administracion\NAYADE\CODIGOS PYTHON\informe automatico hubspot"
 
@@ -803,6 +805,32 @@ owner_filter = st.sidebar.multiselect(
 st.sidebar.divider()
 st.sidebar.caption("🟢 Actividad ≥20%  🟡 10-20%  🔴 <10%")
 st.sidebar.caption("Actividad = notes_last_updated. Tipos: reuniones, emails, llamadas y notas (tareas excluidas).")
+
+# ── Login ──────────────────────────────────────
+
+if APP_PASSWORD:
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        st.markdown("<br>" * 3, unsafe_allow_html=True)
+        col1, col2, col3 = st.columns([1, 1.5, 1])
+        with col2:
+            st.markdown("""
+            <div style="text-align:center; margin-bottom:24px;">
+                <div style="font-size:2.5rem">📊</div>
+                <div style="font-size:1.4rem; font-weight:700; color:#1A3A5C">Pipeline Tracker</div>
+                <div style="font-size:13px; color:#888; margin-top:4px">Zentralcom · HubSpot</div>
+            </div>
+            """, unsafe_allow_html=True)
+            pwd = st.text_input("Contraseña", type="password", placeholder="Introduce la contraseña...")
+            if st.button("Entrar", use_container_width=True):
+                if pwd == APP_PASSWORD:
+                    st.session_state.authenticated = True
+                    st.rerun()
+                else:
+                    st.error("Contraseña incorrecta")
+        st.stop()
 
 # ── Comprobación API ───────────────────────────
 
