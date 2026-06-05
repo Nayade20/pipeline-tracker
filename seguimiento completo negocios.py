@@ -22,7 +22,7 @@ try:
     HUBSPOT_API_KEY = _st.secrets["HUBSPOT_API_KEY"]
     APP_PASSWORD    = _st.secrets["APP_PASSWORD"]
 except Exception:
-    HUBSPOT_API_KEY = "pat-eu1-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    HUBSPOT_API_KEY = "pat-eu1-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # ← solo para uso local
     APP_PASSWORD    = ""  # sin contraseña en local
 
 OUTPUT_DIR = r"C:\Users\Administracion1\Zentralcom\Zentralcom S.L - Documentos\Administracion\NAYADE\CODIGOS PYTHON\informe automatico hubspot"
@@ -1297,8 +1297,12 @@ with tabs[4]:
             "dealname":"Negocio","owner":"Comercial","stage_label":"Etapa actual",
             "pipeline":"Pipeline","days_inactive":"Días sin actividad",
         })
+        try:
+            styled = show_df.style.map(color_dias, subset=["Días sin actividad"])
+        except AttributeError:
+            styled = show_df.style.applymap(color_dias, subset=["Días sin actividad"])
         st.dataframe(
-            show_df.style.applymap(color_dias, subset=["Días sin actividad"]),
+            styled,
             hide_index=True, use_container_width=True, height=350,
         )
 
