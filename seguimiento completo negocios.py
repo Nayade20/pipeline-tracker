@@ -1326,12 +1326,18 @@ with tabs[5]:
     df_heat      = df_heat[df_heat["stage_label"].isin(top_stages)]
     pivot = df_heat.pivot_table(index="owner", columns="stage_label",
                                 values="deal_id", aggfunc="count", fill_value=0)
+    # Añadir fila de totales por etapa
+    pivot_total = pivot.copy()
+    totals = pivot_total.sum(axis=0)
+    totals.name = "TOTAL"
+    pivot_with_total = pd.concat([pivot_total, totals.to_frame().T])
+
     fig = px.imshow(
-        pivot,
+        pivot_with_total,
         color_continuous_scale=["#EBF4FB","#185FA5"],
         aspect="auto", text_auto=True,
         labels={"color":"Negocios"},
-        height=420,
+        height=460,
     )
     fig.update_xaxes(tickangle=-35, tickfont_size=11)
     fig.update_yaxes(tickfont_size=11)
@@ -1340,7 +1346,20 @@ with tabs[5]:
         margin=dict(t=30, b=120, l=150, r=20),
         **PLOT_LAYOUT,
     )
+    # Destacar la fila TOTAL con borde
+    fig.add_hline(
+        y=len(pivot_with_total) - 1.5,
+        line_dash="dash", line_color="#185FA5", line_width=1.5,
+    )
     st.plotly_chart(fig, use_container_width=True)
+
+    # Tabla de totales por etapa debajo
+    st.markdown("##### Total negocios por etapa")
+    totals_df = pd.DataFrame({
+        "Etapa": totals.index,
+        "Total negocios": totals.values.astype(int)
+    }).sort_values("Total negocios", ascending=False)
+    st.dataframe(totals_df, hide_index=True, use_container_width=True, height=300)
 
 
 
