@@ -398,12 +398,13 @@ def owner_stage_matrix(df):
     pivot["TOTAL"] = pivot.sum(axis=1)
     return pivot.reset_index()
 
-# Etapas cerradas — excluidas de estancados y del total de negocios activos
+# Etapas cerradas — excluidas del dashboard principal
 CLOSED_STAGES = WON_STAGES | LOST_STAGES | {
     "991037466",  # Cierre ganado
     "991037467",  # Cierre perdido
     "990804832",  # Negocio ganado
     "996161568",  # Negocio perdido
+    "991276872",  # Contactado sin interés (ambos pipelines)
 }
 
 def stale_deals(df, thresholds, reference_date):
