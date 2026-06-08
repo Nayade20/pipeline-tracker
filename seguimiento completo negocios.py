@@ -677,7 +677,7 @@ def generate_excel(week_label, act_df, stage_df, trans_df, new_df, matrix_df, st
 # ─────────────────────────────────────────────
 
 def show_deal_table(df, title="Negocios", eng_types=None):
-    """Muestra tabla de negocios en la misma página."""
+    """Muestra tabla de negocios con filtros por columna y buscador."""
     if df.empty:
         st.info("No hay negocios que mostrar.")
         return
@@ -696,19 +696,64 @@ def show_deal_table(df, title="Negocios", eng_types=None):
         df2["Tipo actividad"] = df2["deal_id"].apply(
             lambda x: ACT_EMOJI.get(eng_types.get(str(x), "—"), "—")
         )
-        cols = ["dealname","owner","stage_label","pipeline","Tipo actividad","Última actividad"]
+        cols   = ["dealname","owner","stage_label","pipeline","Tipo actividad","Última actividad"]
         rename = {"dealname":"Negocio","owner":"Comercial","stage_label":"Etapa","pipeline":"Pipeline"}
     else:
         cols   = ["dealname","owner","stage_label","pipeline","Última actividad"]
         rename = {"dealname":"Negocio","owner":"Comercial","stage_label":"Etapa","pipeline":"Pipeline"}
 
     show = df2[cols].rename(columns=rename)
-    st.caption(f"**{len(show)}** negocios")
+
+    # ── Filtros ──────────────────────────────────
+    uid = str(abs(hash(title)))[:6]
+    with st.expander("🔍 Filtros", expanded=False):
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            buscar = st.text_input("🔎 Buscar negocio", key=f"buscar_{uid}", placeholder="Escribe para buscar...")
+        with fc2:
+            owners_opts = ["Todos"] + sorted(show["Comercial"].dropna().unique().tolist())
+            owner_sel   = st.selectbox("👤 Comercial", options=owners_opts, key=f"owner_{uid}")
+        with fc3:
+            etapas_opts = ["Todas"] + sorted(show["Etapa"].dropna().unique().tolist())
+            etapa_sel   = st.selectbox("📋 Etapa", options=etapas_opts, key=f"etapa_{uid}")
+
+        fc4, fc5 = st.columns(2)
+        with fc4:
+            pipe_opts = ["Todos"] + sorted(show["Pipeline"].dropna().unique().tolist())
+            pipe_sel  = st.selectbox("🏗️ Pipeline", options=pipe_opts, key=f"pipe_{uid}")
+        with fc5:
+            if "Tipo actividad" in show.columns:
+                tipo_opts = ["Todos"] + sorted(show["Tipo actividad"].dropna().unique().tolist())
+                tipo_sel  = st.selectbox("⚡ Tipo actividad", options=tipo_opts, key=f"tipo_{uid}")
+            else:
+                tipo_sel = "Todos"
+
+    # Aplicar filtros
+    filtered = show.copy()
+    if buscar:
+        filtered = filtered[filtered["Negocio"].str.contains(buscar, case=False, na=False)]
+    if owner_sel != "Todos":
+        filtered = filtered[filtered["Comercial"] == owner_sel]
+    if etapa_sel != "Todas":
+        filtered = filtered[filtered["Etapa"] == etapa_sel]
+    if pipe_sel != "Todos":
+        filtered = filtered[filtered["Pipeline"] == pipe_sel]
+    if tipo_sel != "Todos" and "Tipo actividad" in filtered.columns:
+        filtered = filtered[filtered["Tipo actividad"] == tipo_sel]
+
+    st.caption(f"**{len(filtered)}** negocios" + (f" (de {len(show)} totales)" if len(filtered) != len(show) else ""))
     st.dataframe(
-        show,
+        filtered,
         hide_index=True,
         use_container_width=True,
-        height=min(400, 50 + len(show) * 35),
+        height=min(450, 55 + len(filtered) * 35),
+        column_config={
+            "Negocio":         st.column_config.TextColumn("Negocio", width="large"),
+            "Comercial":       st.column_config.TextColumn("Comercial"),
+            "Etapa":           st.column_config.TextColumn("Etapa", width="large"),
+            "Pipeline":        st.column_config.TextColumn("Pipeline", width="small"),
+            "Última actividad":st.column_config.TextColumn("Última actividad"),
+        }
     )
 
 def semaforo_color(rate):
