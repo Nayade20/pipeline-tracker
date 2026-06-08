@@ -676,6 +676,9 @@ def generate_excel(week_label, act_df, stage_df, trans_df, new_df, matrix_df, st
 # HELPERS DE VISUALIZACIÓN
 # ─────────────────────────────────────────────
 
+# Contador global para claves únicas
+_table_counter = [0]
+
 def show_deal_table(df, title="Negocios", eng_types=None):
     """Muestra tabla de negocios con filtros por columna y buscador."""
     if df.empty:
@@ -705,8 +708,9 @@ def show_deal_table(df, title="Negocios", eng_types=None):
     show = df2[cols].rename(columns=rename)
 
     # ── Filtros ──────────────────────────────────
-    # Generar uid único basado en contenido del df para evitar duplicados
-    uid = str(abs(hash(str(df.shape) + str(df.columns.tolist()) + title + str(len(df)))))[:8]
+    # Contador incremental para garantizar claves únicas
+    _table_counter[0] += 1
+    uid = str(_table_counter[0])
     with st.expander("🔍 Filtros", expanded=False):
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
