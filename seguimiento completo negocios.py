@@ -31,7 +31,7 @@ BASE_URL = "https://api.hubapi.com"
 
 OWNER_NAMES = {
     "74753477":   "Iñigo Mangas",
-    "75326441":   "Usuario 75326441",
+    "75326441":   "Alejandro Alzas",
     "75326442":   "José R. Mendibil",
     "75631012":   "Rafa Quintanilla",
     "75887314":   "Onura Onura",
