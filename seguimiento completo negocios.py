@@ -705,7 +705,8 @@ def show_deal_table(df, title="Negocios", eng_types=None):
     show = df2[cols].rename(columns=rename)
 
     # ── Filtros ──────────────────────────────────
-    uid = str(abs(hash(title)))[:6]
+    # Generar uid único basado en contenido del df para evitar duplicados
+    uid = str(abs(hash(str(df.shape) + str(df.columns.tolist()) + title + str(len(df)))))[:8]
     with st.expander("🔍 Filtros", expanded=False):
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
