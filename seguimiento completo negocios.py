@@ -16,18 +16,26 @@ from openpyxl.chart import BarChart, Reference
 # CONFIGURACIÓN — pon aquí tu API Key
 # ─────────────────────────────────────────────
 
-# Lee la API Key y contraseña desde Streamlit Secrets (cloud) o directamente (local)
+# Lee configuración desde Streamlit Secrets (cloud) o directamente (local)
 import streamlit as _st
 try:
     HUBSPOT_API_KEY = _st.secrets["HUBSPOT_API_KEY"]
     APP_PASSWORD    = _st.secrets["APP_PASSWORD"]
+    FTP_HOST        = _st.secrets.get("FTP_HOST", "")
+    FTP_USER        = _st.secrets.get("FTP_USER", "")
+    FTP_PASS        = _st.secrets.get("FTP_PASS", "")
+    FTP_PATH        = _st.secrets.get("FTP_PATH", "/snapshots.json")
 except Exception:
     HUBSPOT_API_KEY = "pat-eu1-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # ← solo para uso local
-    APP_PASSWORD    = ""  # sin contraseña en local
+    APP_PASSWORD    = ""
+    FTP_HOST = FTP_USER = FTP_PASS = ""
+    FTP_PATH = "/snapshots.json"
 
 OUTPUT_DIR = r"C:\Users\Administracion1\Zentralcom\Zentralcom S.L - Documentos\Administracion\NAYADE\CODIGOS PYTHON\informe automatico hubspot"
 
 BASE_URL = "https://api.hubapi.com"
+
+SNAPSHOTS_FILE = os.path.join(OUTPUT_DIR, "snapshots.json")
 
 OWNER_NAMES = {
     "74753477":   "Iñigo Mangas",
@@ -418,6 +426,79 @@ def stale_deals(df, thresholds, reference_date):
         stale["stage_label"] = stale["dealstage"].map(STAGE_LABELS).fillna(stale["dealstage"])
         results[days] = stale.sort_values("days_inactive", ascending=False)
     return results
+
+# ─────────────────────────────────────────────
+# PERSISTENCIA DE SNAPSHOTS
+# ─────────────────────────────────────────────
+
+import ftplib
+import json
+
+def _snapshots_to_json(snapshots: dict) -> str:
+    data = {}
+    for name, snap in snapshots.items():
+        data[name] = {
+            "week_label": snap["week_label"],
+            "df_week": snap["df_week"].to_json(date_format="iso"),
+            "act_df":  snap["act_df"].to_json(date_format="iso") if snap.get("act_df") is not None else None,
+        }
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+def _json_to_snapshots(raw: str) -> dict:
+    data = json.loads(raw)
+    snapshots = {}
+    for name, snap in data.items():
+        df_week = pd.read_json(snap["df_week"])
+        for col in ["createdate","closedate","last_modified","last_activity_date","notes_last_updated"]:
+            if col in df_week.columns:
+                df_week[col] = pd.to_datetime(df_week[col], utc=True, errors="coerce").dt.tz_convert(None)
+        act_df = pd.read_json(snap["act_df"]) if snap.get("act_df") else None
+        snapshots[name] = {"week_label": snap["week_label"], "df_week": df_week, "act_df": act_df}
+    return snapshots
+
+def save_snapshots_to_file(snapshots: dict):
+    """Guarda snapshots en FTP si está configurado, si no en disco local."""
+    try:
+        json_str = _snapshots_to_json(snapshots)
+        if FTP_HOST and FTP_USER:
+            # Guardar en FTP
+            buf = io.BytesIO(json_str.encode("utf-8"))
+            with ftplib.FTP(FTP_HOST) as ftp:
+                ftp.login(FTP_USER, FTP_PASS)
+                ftp.storbinary(f"STOR {FTP_PATH}", buf)
+        else:
+            # Fallback: disco local
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            with open(SNAPSHOTS_FILE, "w", encoding="utf-8") as f:
+                f.write(json_str)
+        return True
+    except Exception as e:
+        return str(e)
+
+def load_snapshots_from_file() -> dict:
+    """Carga snapshots desde FTP si está configurado, si no desde disco local."""
+    try:
+        if FTP_HOST and FTP_USER:
+            buf = io.BytesIO()
+            with ftplib.FTP(FTP_HOST) as ftp:
+                ftp.login(FTP_USER, FTP_PASS)
+                ftp.retrbinary(f"RETR {FTP_PATH}", buf.write)
+            buf.seek(0)
+            return _json_to_snapshots(buf.read().decode("utf-8"))
+        else:
+            if not os.path.exists(SNAPSHOTS_FILE):
+                return {}
+            with open(SNAPSHOTS_FILE, "r", encoding="utf-8") as f:
+                return _json_to_snapshots(f.read())
+    except Exception:
+        return {}
+
+def delete_snapshot_from_file(name: str, snapshots: dict):
+    if name in snapshots:
+        del snapshots[name]
+        save_snapshots_to_file(snapshots)
+    return snapshots
+
 
 # ─────────────────────────────────────────────
 # EXPORTACIÓN EXCEL
@@ -896,9 +977,9 @@ def cached_real_activity(api_key, since_ts_ms, until_ts_ms):
 def cached_engagement_types(api_key, deal_ids_tuple):
     return get_engagement_types(api_key, list(deal_ids_tuple))
 
-# ── Snapshots en memoria ──────────────────────
+# ── Snapshots persistentes ────────────────────
 if "snapshots" not in st.session_state:
-    st.session_state.snapshots = {}  # {label: {week_label, active_deals_df, act_df}}
+    st.session_state.snapshots = load_snapshots_from_file()
 
 # ── Barra lateral ──────────────────────────────
 
@@ -941,7 +1022,13 @@ if st.sidebar.button("💾 Guardar snapshot actual", use_container_width=True):
     st.session_state["pending_snapshot"] = snapshot_name
 
 if st.session_state.snapshots:
-    st.sidebar.caption(f"{len(st.session_state.snapshots)} snapshot(s) guardado(s): " + ", ".join(st.session_state.snapshots.keys()))
+    st.sidebar.caption(f"📁 {len(st.session_state.snapshots)} snapshot(s) guardado(s):")
+    for sn in list(st.session_state.snapshots.keys()):
+        col_s1, col_s2 = st.sidebar.columns([3, 1])
+        col_s1.caption(f"• {sn}")
+        if col_s2.button("🗑", key=f"del_{sn}", help=f"Eliminar {sn}"):
+            st.session_state.snapshots = delete_snapshot_from_file(sn, st.session_state.snapshots)
+            st.rerun()
 
 st.sidebar.divider()
 st.sidebar.caption("🟢 Actividad ≥20%  🟡 10-20%  🔴 <10%")
@@ -1037,7 +1124,11 @@ if st.session_state.get("pending_snapshot"):
         "df_week":    df_week.copy(),
         "act_df":     act_df.copy(),
     }
-    st.sidebar.success(f"✅ Guardado: {name}")
+    result = save_snapshots_to_file(st.session_state.snapshots)
+    if result is True:
+        st.sidebar.success(f"✅ Guardado: {name}")
+    else:
+        st.sidebar.warning(f"Guardado en memoria (no se pudo guardar en disco: {result})")
 stage_df   = stage_activity_summary(df_all, week_start, week_end)
 new_df     = new_deals_by_stage(df_all, week_start, week_end)
 matrix_df  = owner_stage_matrix(df_all)
