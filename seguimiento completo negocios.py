@@ -819,6 +819,10 @@ def cached_real_activity(api_key, since_ts_ms, until_ts_ms):
 def cached_engagement_types(api_key, deal_ids_tuple):
     return get_engagement_types(api_key, list(deal_ids_tuple))
 
+# ── Snapshots en memoria ──────────────────────
+if "snapshots" not in st.session_state:
+    st.session_state.snapshots = {}  # {label: {week_label, active_deals_df, act_df}}
+
 # ── Barra lateral ──────────────────────────────
 
 api_key = HUBSPOT_API_KEY
@@ -852,6 +856,15 @@ owner_filter = st.sidebar.multiselect(
     "Filtrar comercial", options=sorted(OWNER_NAMES.values()),
     default=[], placeholder="Todos",
 )
+
+st.sidebar.divider()
+st.sidebar.subheader("📸 Snapshots semanales")
+snapshot_name = st.sidebar.text_input("Nombre del snapshot", value=week_label if 'week_label' in dir() else "", placeholder="Ej: Semana 28/05 — 04/06")
+if st.sidebar.button("💾 Guardar snapshot actual", use_container_width=True):
+    st.session_state["pending_snapshot"] = snapshot_name
+
+if st.session_state.snapshots:
+    st.sidebar.caption(f"{len(st.session_state.snapshots)} snapshot(s) guardado(s): " + ", ".join(st.session_state.snapshots.keys()))
 
 st.sidebar.divider()
 st.sidebar.caption("🟢 Actividad ≥20%  🟡 10-20%  🔴 <10%")
@@ -938,6 +951,16 @@ if not df_week.empty:
     activity_detail_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["owner","tipo"])
 
 act_df     = activity_by_owner(df_all, week_start, week_end)
+
+# Guardar snapshot si se solicitó
+if st.session_state.get("pending_snapshot"):
+    name = st.session_state.pop("pending_snapshot")
+    st.session_state.snapshots[name] = {
+        "week_label": week_label,
+        "df_week":    df_week.copy(),
+        "act_df":     act_df.copy(),
+    }
+    st.sidebar.success(f"✅ Guardado: {name}")
 stage_df   = stage_activity_summary(df_all, week_start, week_end)
 new_df     = new_deals_by_stage(df_all, week_start, week_end)
 matrix_df  = owner_stage_matrix(df_all)
@@ -1032,6 +1055,7 @@ tabs = st.tabs([
     "✨ Nuevos negocios",
     "⚠️ Estancados",
     "🌡️ Mapa de calor",
+    "📊 Comparativa semanal",
 ])
 
 # ── TAB 1: COMERCIALES ─────────────────────────
@@ -1411,6 +1435,90 @@ with tabs[5]:
     }).sort_values("Total negocios", ascending=False)
     st.dataframe(totals_df, hide_index=True, use_container_width=True, height=300)
 
+
+
+# ── TAB 7: COMPARATIVA ────────────────────────
+
+with tabs[6]:
+    st.subheader("📊 Comparativa entre semanas")
+    st.caption("Guarda snapshots de distintas semanas desde la barra lateral y compáralas aquí.")
+
+    if len(st.session_state.snapshots) < 1:
+        st.info("Todavía no hay snapshots guardados. Selecciona un período, carga los datos y pulsa 'Guardar snapshot actual' en la barra lateral.")
+    else:
+        snap_keys = list(st.session_state.snapshots.keys())
+
+        c1, c2 = st.columns(2)
+        with c1:
+            snap_a = st.selectbox("Semana A", options=snap_keys, key="snap_a")
+        with c2:
+            snap_b = st.selectbox("Semana B", options=snap_keys, key="snap_b",
+                                  index=min(1, len(snap_keys)-1))
+
+        if snap_a and snap_b and snap_a != snap_b:
+            sa = st.session_state.snapshots[snap_a]
+            sb = st.session_state.snapshots[snap_b]
+
+            dfa = sa["df_week"]
+            dfb = sb["df_week"]
+
+            # ── KPIs comparativos ─────────────────
+            st.divider()
+            st.markdown("##### Comparativa de actividad")
+            kc1, kc2, kc3, kc4 = st.columns(4)
+            kc1.metric("Activos " + snap_a, len(dfa))
+            kc2.metric("Activos " + snap_b, len(dfb),
+                       delta=f"{len(dfb)-len(dfa):+d} vs {snap_a}")
+            kc3.metric("Solo en " + snap_a, len(set(dfa["deal_id"]) - set(dfb["deal_id"])),
+                       help="Negocios que tuvieron actividad en A pero no en B")
+            kc4.metric("Solo en " + snap_b, len(set(dfb["deal_id"]) - set(dfa["deal_id"])),
+                       help="Negocios que tuvieron actividad en B pero no en A")
+
+            # ── Gráfico comparativo por comercial ─
+            st.divider()
+            st.markdown("##### Actividad por comercial")
+
+            act_a = dfa.groupby("owner").size().reset_index(name=snap_a)
+            act_b = dfb.groupby("owner").size().reset_index(name=snap_b)
+            comp_df = act_a.merge(act_b, on="owner", how="outer").fillna(0)
+            comp_df[snap_a] = comp_df[snap_a].astype(int)
+            comp_df[snap_b] = comp_df[snap_b].astype(int)
+            comp_df["diferencia"] = comp_df[snap_b] - comp_df[snap_a]
+            comp_df = comp_df.sort_values(snap_b, ascending=False)
+
+            import plotly.graph_objects as go_c
+            fig = go_c.Figure()
+            fig.add_bar(name=snap_a, x=comp_df["owner"], y=comp_df[snap_a],
+                        marker_color="#B5D4F4", marker_line_width=0)
+            fig.add_bar(name=snap_b, x=comp_df["owner"], y=comp_df[snap_b],
+                        marker_color="#185FA5", marker_line_width=0)
+            fig.update_layout(
+                barmode="group", height=380,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                **PLOT_LAYOUT
+            )
+            fig.update_xaxes(tickangle=-20)
+            st.plotly_chart(fig, use_container_width=True)
+
+            # ── Tabla comparativa ─────────────────
+            st.markdown("##### Detalle por comercial")
+            comp_show = comp_df.rename(columns={"owner": "Comercial", "diferencia": "Diferencia (B-A)"})
+            st.dataframe(comp_show, hide_index=True, use_container_width=True,
+                         column_config={"Diferencia (B-A)": st.column_config.NumberColumn(
+                             "Diferencia (B-A)", format="%+d")})
+
+            # ── Negocios nuevos en B que no estaban en A ─
+            st.divider()
+            st.markdown("##### Negocios que se activaron en B pero no estaban activos en A")
+            nuevos_en_b = dfb[~dfb["deal_id"].isin(dfa["deal_id"])].copy()
+            show_deal_table(nuevos_en_b, title="nuevos_en_b")
+
+            st.markdown("##### Negocios que estaban activos en A pero no en B")
+            perdidos_en_b = dfa[~dfa["deal_id"].isin(dfb["deal_id"])].copy()
+            show_deal_table(perdidos_en_b, title="perdidos_en_b")
+
+        elif snap_a == snap_b:
+            st.warning("Selecciona dos snapshots diferentes para comparar.")
 
 
 # ── EXPORTAR EXCEL ─────────────────────────────
