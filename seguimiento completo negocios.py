@@ -445,15 +445,63 @@ def _snapshots_to_json(snapshots: dict) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 def _json_to_snapshots(raw: str) -> dict:
-    data = json.loads(raw)
+    """
+    Convierte el JSON guardado en snapshots.
+
+    Versión robusta: si el archivo remoto/local no tiene el formato esperado
+    de snapshots, no rompe la app; devuelve {} para arrancar sin snapshots.
+    Esto evita errores cuando snapshots.json contiene por accidente un DataFrame
+    u otro JSON, por ejemplo {"deal_id": {...}, "dealname": {...}}.
+    """
+    if not raw or not str(raw).strip():
+        return {}
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
     snapshots = {}
     for name, snap in data.items():
-        df_week = pd.read_json(snap["df_week"])
-        for col in ["createdate","closedate","last_modified","last_activity_date","notes_last_updated"]:
+        # Cada snapshot válido debe ser un dict con estas claves.
+        # Si no, se ignora en vez de lanzar KeyError.
+        if not isinstance(snap, dict):
+            continue
+        if "week_label" not in snap or "df_week" not in snap:
+            continue
+
+        try:
+            df_week = pd.read_json(io.StringIO(snap["df_week"]))
+        except Exception:
+            # Compatibilidad por si pandas acepta directamente string en versiones antiguas
+            try:
+                df_week = pd.read_json(snap["df_week"])
+            except Exception:
+                continue
+
+        for col in ["createdate", "closedate", "last_modified", "last_activity_date", "notes_last_updated"]:
             if col in df_week.columns:
                 df_week[col] = pd.to_datetime(df_week[col], utc=True, errors="coerce").dt.tz_convert(None)
-        act_df = pd.read_json(snap["act_df"]) if snap.get("act_df") else None
-        snapshots[name] = {"week_label": snap["week_label"], "df_week": df_week, "act_df": act_df}
+
+        act_df = None
+        if snap.get("act_df"):
+            try:
+                act_df = pd.read_json(io.StringIO(snap["act_df"]))
+            except Exception:
+                try:
+                    act_df = pd.read_json(snap["act_df"])
+                except Exception:
+                    act_df = None
+
+        snapshots[str(name)] = {
+            "week_label": snap.get("week_label", str(name)),
+            "df_week": df_week,
+            "act_df": act_df,
+        }
+
     return snapshots
 
 def save_snapshots_to_file(snapshots: dict):
