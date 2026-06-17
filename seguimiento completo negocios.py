@@ -463,7 +463,8 @@ def save_snapshots_to_file(snapshots: dict):
         if FTP_HOST and FTP_USER:
             # Guardar en FTP
             buf = io.BytesIO(json_str.encode("utf-8"))
-            with ftplib.FTP(FTP_HOST) as ftp:
+            with ftplib.FTP(timeout=5) as ftp:
+                ftp.connect(FTP_HOST, timeout=5)
                 ftp.login(FTP_USER, FTP_PASS)
                 ftp.storbinary(f"STOR {FTP_PATH}", buf)
         else:
@@ -480,9 +481,13 @@ def load_snapshots_from_file() -> dict:
     try:
         if FTP_HOST and FTP_USER:
             buf = io.BytesIO()
-            with ftplib.FTP(FTP_HOST) as ftp:
+            with ftplib.FTP(timeout=5) as ftp:
+                ftp.connect(FTP_HOST, timeout=5)
                 ftp.login(FTP_USER, FTP_PASS)
-                ftp.retrbinary(f"RETR {FTP_PATH}", buf.write)
+                try:
+                    ftp.retrbinary(f"RETR {FTP_PATH}", buf.write)
+                except ftplib.error_perm:
+                    return {}  # archivo no existe aún
             buf.seek(0)
             return _json_to_snapshots(buf.read().decode("utf-8"))
         else:
@@ -980,6 +985,7 @@ def cached_engagement_types(api_key, deal_ids_tuple):
 # ── Snapshots persistentes ────────────────────
 if "snapshots" not in st.session_state:
     st.session_state.snapshots = load_snapshots_from_file()
+    st.session_state["ftp_ok"] = len(st.session_state.snapshots) >= 0  # marca que intentó cargar
 
 # ── Barra lateral ──────────────────────────────
 
@@ -1017,6 +1023,16 @@ owner_filter = st.sidebar.multiselect(
 
 st.sidebar.divider()
 st.sidebar.subheader("📸 Snapshots semanales")
+if FTP_HOST and FTP_USER:
+    if st.sidebar.button("🔌 Probar conexión FTP", use_container_width=True):
+        try:
+            import ftplib as _ftplib
+            with _ftplib.FTP(timeout=5) as _ftp:
+                _ftp.connect(FTP_HOST, timeout=5)
+                _ftp.login(FTP_USER, FTP_PASS)
+                st.sidebar.success(f"✅ FTP conectado: {FTP_HOST}")
+        except Exception as _e:
+            st.sidebar.error(f"❌ FTP error: {_e}")
 snapshot_name = st.sidebar.text_input("Nombre del snapshot", value=week_label if 'week_label' in dir() else "", placeholder="Ej: Semana 28/05 — 04/06")
 if st.sidebar.button("💾 Guardar snapshot actual", use_container_width=True):
     st.session_state["pending_snapshot"] = snapshot_name
@@ -1126,9 +1142,13 @@ if st.session_state.get("pending_snapshot"):
     }
     result = save_snapshots_to_file(st.session_state.snapshots)
     if result is True:
-        st.sidebar.success(f"✅ Guardado: {name}")
+        if FTP_HOST and FTP_USER:
+            st.sidebar.success(f"✅ Guardado en FTP: {name}")
+        else:
+            st.sidebar.success(f"✅ Guardado en disco: {name}")
     else:
-        st.sidebar.warning(f"Guardado en memoria (no se pudo guardar en disco: {result})")
+        st.sidebar.error(f"❌ Error al guardar: {result}")
+        st.sidebar.info("El snapshot queda guardado en memoria hasta que cierres la app.")
 stage_df   = stage_activity_summary(df_all, week_start, week_end)
 new_df     = new_deals_by_stage(df_all, week_start, week_end)
 matrix_df  = owner_stage_matrix(df_all)
