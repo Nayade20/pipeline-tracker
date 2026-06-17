@@ -658,7 +658,82 @@ def xl_sheet_matriz(wb, matrix_df):
     xl_auto_width(ws, min_w=8, max_w=30)
     ws.freeze_panes = "B5"
 
-def generate_excel(week_label, act_df, stage_df, trans_df, new_df, matrix_df, stale_data):
+def xl_sheet_comparativa(wb, snap_a_name, snap_b_name, dfa, dfb, act_a, act_b):
+    """Pestaña única de comparativa con tabla unificada y tendencia."""
+
+    ids_a = set(dfa["deal_id"])
+    ids_b = set(dfb["deal_id"])
+
+    # Tabla unificada
+    all_df = pd.concat([dfa, dfb]).drop_duplicates(subset="deal_id").copy()
+    all_df["stage_label"] = all_df["dealstage"].map(STAGE_LABELS).fillna(all_df["dealstage"])
+    all_df[snap_a_name[:15]] = all_df["deal_id"].apply(lambda x: "SI" if x in ids_a else "NO")
+    all_df[snap_b_name[:15]] = all_df["deal_id"].apply(lambda x: "SI" if x in ids_b else "NO")
+    all_df["Tendencia"] = all_df["deal_id"].apply(
+        lambda x: "Sube"     if x in ids_b and x not in ids_a
+             else "Baja"     if x in ids_a and x not in ids_b
+             else "Mantiene"
+    )
+    all_df = all_df.sort_values("Tendencia")
+
+    # ── Pestaña 1: Tabla unificada ────────────
+    ws1 = wb.create_sheet("📊 Comparativa negocios")
+    xl_header(ws1, f"Comparativa: {snap_a_name} vs {snap_b_name}",
+              f"Sube: {len(ids_b-ids_a)} | Baja: {len(ids_a-ids_b)} | Mantiene: {len(ids_a&ids_b)}", 7)
+    r = 4
+    headers = ["Negocio","Comercial","Etapa","Pipeline", snap_a_name[:15], snap_b_name[:15], "Tendencia"]
+    for ci, h in enumerate(headers, 1):
+        ws1.cell(r, ci, h)
+    xl_style_headers(ws1, r, 7)
+    ds = r + 1
+    for _, row in all_df.iterrows():
+        r += 1
+        ws1.cell(r, 1, row.get("dealname",""))
+        ws1.cell(r, 2, row.get("owner",""))
+        ws1.cell(r, 3, row.get("stage_label",""))
+        ws1.cell(r, 4, row.get("pipeline",""))
+        ws1.cell(r, 5, row[snap_a_name[:15]])
+        ws1.cell(r, 6, row[snap_b_name[:15]])
+        tend = row["Tendencia"]
+        ws1.cell(r, 7, tend)
+        if tend == "Sube":
+            ws1.cell(r, 7).fill = GREEN_FILL
+        elif tend == "Baja":
+            ws1.cell(r, 7).fill = RED_FILL
+        else:
+            ws1.cell(r, 7).fill = ACCENT_FILL
+    xl_style_data(ws1, ds, r, 7)
+    xl_auto_width(ws1)
+    ws1.freeze_panes = "A5"
+
+    # ── Pestaña 2: Diferencia por comercial ──
+    ws2 = wb.create_sheet("👤 Diferencia comercial")
+    xl_header(ws2, "Comparativa de actividad por comercial", f"{snap_a_name} vs {snap_b_name}", 4)
+    r = 4
+    for ci, h in enumerate(["Comercial", snap_a_name[:20], snap_b_name[:20], "Diferencia"], 1):
+        ws2.cell(r, ci, h)
+    xl_style_headers(ws2, r, 4)
+    ds = r + 1
+    comp = act_a.merge(act_b, on="owner", how="outer", suffixes=("_a","_b")).fillna(0)
+    comp["active_this_week_a"] = comp["active_this_week_a"].astype(int)
+    comp["active_this_week_b"] = comp["active_this_week_b"].astype(int)
+    comp["diff"] = comp["active_this_week_b"] - comp["active_this_week_a"]
+    comp = comp.sort_values("active_this_week_b", ascending=False)
+    for _, row in comp.iterrows():
+        r += 1
+        d = int(row["diff"])
+        ws2.cell(r, 1, row["owner"])
+        ws2.cell(r, 2, int(row["active_this_week_a"]))
+        ws2.cell(r, 3, int(row["active_this_week_b"]))
+        ws2.cell(r, 4, f"+{d}" if d > 0 else str(d))
+        ws2.cell(r, 4).fill = GREEN_FILL if d > 0 else (RED_FILL if d < 0 else PatternFill())
+    xl_style_data(ws2, ds, r, 4)
+    xl_auto_width(ws2)
+    ws2.freeze_panes = "A5"
+
+
+def generate_excel(week_label, act_df, stage_df, trans_df, new_df, matrix_df, stale_data,
+                   comparativa=None):
     wb = Workbook()
     wb.remove(wb.active)
     xl_sheet_resumen(wb, week_label, act_df, stage_df, trans_df, new_df, stale_data)
@@ -668,6 +743,8 @@ def generate_excel(week_label, act_df, stage_df, trans_df, new_df, matrix_df, st
     xl_sheet_nuevos(wb, week_label, new_df)
     xl_sheet_estancados(wb, stale_data)
     xl_sheet_matriz(wb, matrix_df)
+    if comparativa:
+        xl_sheet_comparativa(wb, **comparativa)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -1462,63 +1539,83 @@ with tabs[6]:
             dfa = sa["df_week"]
             dfb = sb["df_week"]
 
-            # ── KPIs comparativos ─────────────────
-            st.divider()
-            st.markdown("##### Comparativa de actividad")
-            kc1, kc2, kc3, kc4 = st.columns(4)
-            kc1.metric("Activos " + snap_a, len(dfa))
-            kc2.metric("Activos " + snap_b, len(dfb),
-                       delta=f"{len(dfb)-len(dfa):+d} vs {snap_a}")
-            kc3.metric("Solo en " + snap_a, len(set(dfa["deal_id"]) - set(dfb["deal_id"])),
-                       help="Negocios que tuvieron actividad en A pero no en B")
-            kc4.metric("Solo en " + snap_b, len(set(dfb["deal_id"]) - set(dfa["deal_id"])),
-                       help="Negocios que tuvieron actividad en B pero no en A")
+            ids_a = set(dfa["deal_id"])
+            ids_b = set(dfb["deal_id"])
 
-            # ── Gráfico comparativo por comercial ─
+            # ── KPIs ─────────────────────────────
+            st.divider()
+            kc1, kc2, kc3, kc4 = st.columns(4)
+            kc1.metric(f"Activos {snap_a}", len(dfa))
+            kc2.metric(f"Activos {snap_b}", len(dfb), delta=f"{len(dfb)-len(dfa):+d}")
+            kc3.metric("↑ Suben actividad", len(ids_b - ids_a), help=f"Activos en {snap_b} pero no en {snap_a}")
+            kc4.metric("↓ Bajan actividad", len(ids_a - ids_b), help=f"Activos en {snap_a} pero no en {snap_b}")
+
+            # ── Gráfico por comercial ─────────────
             st.divider()
             st.markdown("##### Actividad por comercial")
-
-            act_a = dfa.groupby("owner").size().reset_index(name=snap_a)
-            act_b = dfb.groupby("owner").size().reset_index(name=snap_b)
+            act_a = dfa.groupby("owner").size().reset_index(name="n_a")
+            act_b = dfb.groupby("owner").size().reset_index(name="n_b")
             comp_df = act_a.merge(act_b, on="owner", how="outer").fillna(0)
-            comp_df[snap_a] = comp_df[snap_a].astype(int)
-            comp_df[snap_b] = comp_df[snap_b].astype(int)
-            comp_df["diferencia"] = comp_df[snap_b] - comp_df[snap_a]
-            comp_df = comp_df.sort_values(snap_b, ascending=False)
+            comp_df["n_a"] = comp_df["n_a"].astype(int)
+            comp_df["n_b"] = comp_df["n_b"].astype(int)
+            comp_df = comp_df.sort_values("n_b", ascending=False)
 
-            import plotly.graph_objects as go_c
-            fig = go_c.Figure()
-            fig.add_bar(name=snap_a, x=comp_df["owner"], y=comp_df[snap_a],
+            fig = go.Figure()
+            fig.add_bar(name=snap_a, x=comp_df["owner"], y=comp_df["n_a"],
                         marker_color="#B5D4F4", marker_line_width=0)
-            fig.add_bar(name=snap_b, x=comp_df["owner"], y=comp_df[snap_b],
+            fig.add_bar(name=snap_b, x=comp_df["owner"], y=comp_df["n_b"],
                         marker_color="#185FA5", marker_line_width=0)
-            fig.update_layout(
-                barmode="group", height=380,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                **PLOT_LAYOUT
-            )
+            fig.update_layout(barmode="group", height=360,
+                              legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                              **PLOT_LAYOUT)
             fig.update_xaxes(tickangle=-20)
             st.plotly_chart(fig, use_container_width=True)
 
-            # ── Tabla comparativa ─────────────────
-            st.markdown("##### Detalle por comercial")
-            comp_show = comp_df.rename(columns={"owner": "Comercial", "diferencia": "Diferencia (B-A)"})
-            st.dataframe(comp_show, hide_index=True, use_container_width=True,
-                         column_config={"Diferencia (B-A)": st.column_config.NumberColumn(
-                             "Diferencia (B-A)", format="%+d")})
-
-            # ── Negocios nuevos en B que no estaban en A ─
+            # ── Tabla unificada con tendencia ─────
             st.divider()
-            st.markdown("##### Negocios que se activaron en B pero no estaban activos en A")
-            nuevos_en_b = dfb[~dfb["deal_id"].isin(dfa["deal_id"])].copy()
-            show_deal_table(nuevos_en_b, title="nuevos_en_b")
+            st.markdown("##### Detalle de negocios — actividad por período")
 
-            st.markdown("##### Negocios que estaban activos en A pero no en B")
-            perdidos_en_b = dfa[~dfa["deal_id"].isin(dfb["deal_id"])].copy()
-            show_deal_table(perdidos_en_b, title="perdidos_en_b")
+            # Unir todos los negocios de ambas semanas
+            all_ids = ids_a | ids_b
+            df_all_snap = pd.concat([dfa, dfb]).drop_duplicates(subset="deal_id")
+            df_all_snap = df_all_snap[df_all_snap["deal_id"].isin(all_ids)].copy()
+            df_all_snap["stage_label"] = df_all_snap["dealstage"].map(STAGE_LABELS).fillna(df_all_snap["dealstage"])
+
+            df_all_snap[snap_a] = df_all_snap["deal_id"].apply(lambda x: "✅" if x in ids_a else "❌")
+            df_all_snap[snap_b] = df_all_snap["deal_id"].apply(lambda x: "✅" if x in ids_b else "❌")
+            df_all_snap["Tendencia"] = df_all_snap["deal_id"].apply(
+                lambda x: "↑ Sube"     if x in ids_b and x not in ids_a
+                     else "↓ Baja"     if x in ids_a and x not in ids_b
+                     else "→ Mantiene"
+            )
+
+            show_comp = df_all_snap[["dealname","owner","stage_label","pipeline", snap_a, snap_b, "Tendencia"]].rename(columns={
+                "dealname":    "Negocio",
+                "owner":       "Comercial",
+                "stage_label": "Etapa",
+                "pipeline":    "Pipeline",
+            }).sort_values("Tendencia")
+
+            # Filtros rápidos
+            tend_filter = st.radio("Filtrar por tendencia:", ["Todos", "↑ Sube", "↓ Baja", "→ Mantiene"], horizontal=True)
+            if tend_filter != "Todos":
+                show_comp = show_comp[show_comp["Tendencia"] == tend_filter]
+
+            st.caption(f"**{len(show_comp)}** negocios")
+            st.dataframe(
+                show_comp,
+                hide_index=True,
+                use_container_width=True,
+                height=min(500, 55 + len(show_comp) * 35),
+                column_config={
+                    "Tendencia": st.column_config.TextColumn("Tendencia", width="small"),
+                    snap_a:      st.column_config.TextColumn(snap_a, width="small"),
+                    snap_b:      st.column_config.TextColumn(snap_b, width="small"),
+                }
+            )
 
         elif snap_a == snap_b:
-            st.warning("Selecciona dos snapshots diferentes para comparar.")
+            st.warning("Selecciona dos períodos diferentes para comparar.")
 
 
 # ── EXPORTAR EXCEL ─────────────────────────────
@@ -1528,7 +1625,27 @@ st.subheader("📥 Exportar a Excel")
 st.caption("Excel con 7 pestañas: resumen, actividad, etapas, cambios, nuevos, estancados y matriz completa.")
 
 filename    = f"pipeline_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
-excel_bytes = generate_excel(week_label, act_df, stage_df, trans_df, new_df, matrix_df, stale_data)
+
+# Incluir comparativa en Excel si hay snapshots seleccionados
+comp_excel = None
+snap_keys = list(st.session_state.snapshots.keys())
+if len(snap_keys) >= 2:
+    snap_a_key = st.session_state.get("snap_a", snap_keys[0])
+    snap_b_key = st.session_state.get("snap_b", snap_keys[1] if len(snap_keys) > 1 else snap_keys[0])
+    if snap_a_key != snap_b_key and snap_a_key in st.session_state.snapshots and snap_b_key in st.session_state.snapshots:
+        sa = st.session_state.snapshots[snap_a_key]
+        sb = st.session_state.snapshots[snap_b_key]
+        comp_excel = {
+            "snap_a_name": snap_a_key,
+            "snap_b_name": snap_b_key,
+            "dfa":         sa["df_week"],
+            "dfb":         sb["df_week"],
+            "act_a":       sa["act_df"],
+            "act_b":       sb["act_df"],
+        }
+
+excel_bytes = generate_excel(week_label, act_df, stage_df, trans_df, new_df, matrix_df, stale_data,
+                              comparativa=comp_excel)
 
 c1, c2 = st.columns(2)
 with c1:
