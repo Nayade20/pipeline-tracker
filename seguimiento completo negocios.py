@@ -489,13 +489,17 @@ def load_snapshots_from_file() -> dict:
                 except ftplib.error_perm:
                     return {}  # archivo no existe aún
             buf.seek(0)
-            return _json_to_snapshots(buf.read().decode("utf-8"))
+            raw = buf.read().decode("utf-8")
+            if not raw.strip():
+                return {}
+            return _json_to_snapshots(raw)
         else:
             if not os.path.exists(SNAPSHOTS_FILE):
                 return {}
             with open(SNAPSHOTS_FILE, "r", encoding="utf-8") as f:
                 return _json_to_snapshots(f.read())
-    except Exception:
+    except Exception as e:
+        st.session_state["ftp_load_error"] = str(e)
         return {}
 
 def delete_snapshot_from_file(name: str, snapshots: dict):
@@ -1036,6 +1040,9 @@ if FTP_HOST and FTP_USER:
 snapshot_name = st.sidebar.text_input("Nombre del snapshot", value=week_label if 'week_label' in dir() else "", placeholder="Ej: Semana 28/05 — 04/06")
 if st.sidebar.button("💾 Guardar snapshot actual", use_container_width=True):
     st.session_state["pending_snapshot"] = snapshot_name
+
+if st.session_state.get("ftp_load_error"):
+    st.sidebar.warning(f"⚠️ Error al cargar FTP: {st.session_state['ftp_load_error']}")
 
 if st.session_state.snapshots:
     st.sidebar.caption(f"📁 {len(st.session_state.snapshots)} snapshot(s) guardado(s):")
