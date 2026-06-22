@@ -1781,8 +1781,8 @@ with tabs[6]:
             df_all_snap[snap_a] = df_all_snap["deal_id"].apply(lambda x: "✅" if x in ids_a else "❌")
             df_all_snap[snap_b] = df_all_snap["deal_id"].apply(lambda x: "✅" if x in ids_b else "❌")
             df_all_snap["Tendencia"] = df_all_snap["deal_id"].apply(
-                lambda x: "✅ Activo ahora"     if x in ids_b and x not in ids_a
-                     else "💤 Sin actividad ahora" if x in ids_a and x not in ids_b
+                lambda x: "✅ Nueva actividad"   if x in ids_b and x not in ids_a
+                     else "📉 Perdió actividad"  if x in ids_a and x not in ids_b
                      else "🔄 Activo en ambos"
             )
 
@@ -1794,7 +1794,7 @@ with tabs[6]:
             }).sort_values("Tendencia")
 
             # Filtros rápidos
-            tend_filter = st.radio("Filtrar por tendencia:", ["Todos", "✅ Activo ahora", "💤 Sin actividad ahora", "🔄 Activo en ambos"], horizontal=True)
+            tend_filter = st.radio("Filtrar por tendencia:", ["Todos", "✅ Nueva actividad", "📉 Perdió actividad", "🔄 Activo en ambos"], horizontal=True)
             if tend_filter != "Todos":
                 show_comp = show_comp[show_comp["Tendencia"] == tend_filter]
 
