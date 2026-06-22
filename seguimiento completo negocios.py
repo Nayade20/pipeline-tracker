@@ -485,6 +485,9 @@ def _json_to_snapshots(raw: str) -> dict:
         for col in ["createdate", "closedate", "last_modified", "last_activity_date", "notes_last_updated"]:
             if col in df_week.columns:
                 df_week[col] = pd.to_datetime(df_week[col], utc=True, errors="coerce").dt.tz_convert(None)
+                # Traducir etapas — compatibilidad con snapshots guardados antes de esta corrección
+        if "dealstage" in df_week.columns:
+            df_week["stage_label"] = df_week["dealstage"].map(STAGE_LABELS).fillna(df_week["dealstage"])
 
         act_df = None
         if snap.get("act_df"):
