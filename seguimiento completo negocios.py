@@ -1766,6 +1766,7 @@ with tabs[6]:
             all_ids = ids_a | ids_b
             df_all_snap = pd.concat([dfa, dfb]).drop_duplicates(subset="deal_id")
             df_all_snap = df_all_snap[df_all_snap["deal_id"].isin(all_ids)].copy()
+            if "stage_label" not in df_all_snap.columns or df_all_snap["stage_label"].str.match(r'^\d+$').any():
             df_all_snap["stage_label"] = df_all_snap["dealstage"].map(STAGE_LABELS).fillna(df_all_snap["dealstage"])
 
             df_all_snap[snap_a] = df_all_snap["deal_id"].apply(lambda x: "✅" if x in ids_a else "❌")
