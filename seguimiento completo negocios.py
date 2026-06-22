@@ -1724,6 +1724,14 @@ with tabs[6]:
             sa = st.session_state.snapshots[snap_a]
             sb = st.session_state.snapshots[snap_b]
 
+            # Ordenar automáticamente: A = más antiguo, B = más reciente
+            label_a = sa["week_label"]
+            label_b = sb["week_label"]
+            if snap_a > snap_b:  # orden alfabético por nombre del snapshot
+                sa, sb = sb, sa
+                snap_a, snap_b = snap_b, snap_a
+                label_a, label_b = label_b, label_a
+
             dfa = sa["df_week"]
             dfb = sb["df_week"]
 
@@ -1773,9 +1781,9 @@ with tabs[6]:
             df_all_snap[snap_a] = df_all_snap["deal_id"].apply(lambda x: "✅" if x in ids_a else "❌")
             df_all_snap[snap_b] = df_all_snap["deal_id"].apply(lambda x: "✅" if x in ids_b else "❌")
             df_all_snap["Tendencia"] = df_all_snap["deal_id"].apply(
-                lambda x: "↑ Sube"     if x in ids_b and x not in ids_a
-                     else "↓ Baja"     if x in ids_a and x not in ids_b
-                     else "→ Mantiene"
+                lambda x: "✅ Activo ahora"     if x in ids_b and x not in ids_a
+                     else "💤 Sin actividad ahora" if x in ids_a and x not in ids_b
+                     else "🔄 Activo en ambos"
             )
 
             show_comp = df_all_snap[["dealname","owner","stage_label","pipeline", snap_a, snap_b, "Tendencia"]].rename(columns={
@@ -1786,7 +1794,7 @@ with tabs[6]:
             }).sort_values("Tendencia")
 
             # Filtros rápidos
-            tend_filter = st.radio("Filtrar por tendencia:", ["Todos", "↑ Sube", "↓ Baja", "→ Mantiene"], horizontal=True)
+            tend_filter = st.radio("Filtrar por tendencia:", ["Todos", "✅ Activo ahora", "💤 Sin actividad ahora", "🔄 Activo en ambos"], horizontal=True)
             if tend_filter != "Todos":
                 show_comp = show_comp[show_comp["Tendencia"] == tend_filter]
 
