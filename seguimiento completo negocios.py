@@ -487,6 +487,7 @@ def _json_to_snapshots(raw: str) -> dict:
                 df_week[col] = pd.to_datetime(df_week[col], utc=True, errors="coerce").dt.tz_convert(None)
                 # Traducir etapas — compatibilidad con snapshots guardados antes de esta corrección
         if "dealstage" in df_week.columns:
+            df_week["dealstage"] = df_week["dealstage"].astype(str)
             df_week["stage_label"] = df_week["dealstage"].map(STAGE_LABELS).fillna(df_week["dealstage"])
 
         act_df = None
@@ -1766,6 +1767,7 @@ with tabs[6]:
             all_ids = ids_a | ids_b
             df_all_snap = pd.concat([dfa, dfb]).drop_duplicates(subset="deal_id")
             df_all_snap = df_all_snap[df_all_snap["deal_id"].isin(all_ids)].copy()
+            df_all_snap["dealstage"] = df_all_snap["dealstage"].astype(str)
             df_all_snap["stage_label"] = df_all_snap["dealstage"].map(STAGE_LABELS).fillna(df_all_snap["dealstage"])
 
             df_all_snap[snap_a] = df_all_snap["deal_id"].apply(lambda x: "✅" if x in ids_a else "❌")
