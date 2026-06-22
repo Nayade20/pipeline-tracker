@@ -1101,6 +1101,16 @@ if st.session_state.snapshots:
             st.session_state.snapshots = delete_snapshot_from_file(sn, st.session_state.snapshots)
             st.rerun()
 
+# ── Ver snapshot guardado ─────────────────────
+if st.session_state.snapshots:
+    st.sidebar.divider()
+    snap_keys_all = ["— Ver período actual —"] + list(st.session_state.snapshots.keys())
+    snap_ver = st.sidebar.selectbox("👁️ Visualizar snapshot:", options=snap_keys_all, key="snap_ver")
+    if snap_ver != "— Ver período actual —":
+        st.session_state["modo_snapshot"] = snap_ver
+    else:
+        st.session_state["modo_snapshot"] = None
+
 st.sidebar.divider()
 st.sidebar.caption("🟢 Actividad ≥20%  🟡 10-20%  🔴 <10%")
 st.sidebar.caption("Actividad = notes_last_updated. Tipos: reuniones, emails, llamadas y notas (tareas excluidas).")
@@ -1186,6 +1196,14 @@ if not df_week.empty:
     activity_detail_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["owner","tipo"])
 
 act_df     = activity_by_owner(df_all, week_start, week_end)
+# ── Modo visualización de snapshot ────────────
+modo_snap = st.session_state.get("modo_snapshot")
+if modo_snap and modo_snap in st.session_state.snapshots:
+    snap_data  = st.session_state.snapshots[modo_snap]
+    df_week    = snap_data["df_week"]
+    if snap_data.get("act_df") is not None:
+        act_df = snap_data["act_df"]
+    week_label = f"📸 SNAPSHOT: {modo_snap}"
 
 # Guardar snapshot si se solicitó
 if st.session_state.get("pending_snapshot"):
