@@ -264,16 +264,17 @@ def get_engagement_types(api_key, deal_ids):
         url = f"https://api.hubapi.com/engagements/v1/engagements/associated/deal/{deal_id}/paged?limit=100"
         try:
             data = hs_get(api_key, url)
-            ultima, tipo = None, "—"
-            ahora = datetime.now()
+            ultima_ts, tipo = None, "—"
+            # Comparación en epoch ms: no depende de la zona horaria del servidor
+            ahora_ms = int(time.time() * 1000)
             for item in data.get("results", []):
                 eng = item.get("engagement", {})
                 t   = eng.get("type", "")
                 ts  = eng.get("timestamp")
                 if t in TIPO_MAP and ts:
-                    fecha = datetime.fromtimestamp(ts / 1000)
-                    if fecha <= ahora and (not ultima or fecha > ultima):
-                        ultima, tipo = fecha, TIPO_MAP[t]
+                    # Actividades futuras (reuniones agendadas) → no cuentan
+                    if ts <= ahora_ms and (ultima_ts is None or ts > ultima_ts):
+                        ultima_ts, tipo = ts, TIPO_MAP[t]
             results[str(deal_id)] = tipo
         except Exception:
             results[str(deal_id)] = "—"
@@ -466,6 +467,8 @@ def _snapshots_to_json(snapshots: dict) -> str:
             "week_label": snap["week_label"],
             "df_week": df_save.to_json(date_format="iso"),
             "act_df":  snap["act_df"].to_json(date_format="iso") if snap.get("act_df") is not None else None,
+            # Tipo de actividad congelado en el momento de guardar el snapshot
+            "eng_types": snap.get("eng_types") or {},
         }
     return json.dumps(data, ensure_ascii=False, indent=2)
 
@@ -536,6 +539,8 @@ def _json_to_snapshots(raw: str) -> dict:
             "week_label": snap.get("week_label", str(name)),
             "df_week": df_week,
             "act_df": act_df,
+            # Snapshots antiguos no guardaban el tipo de actividad → {}
+            "eng_types": snap.get("eng_types") if isinstance(snap.get("eng_types"), dict) else {},
         }
 
     return snapshots
@@ -1246,6 +1251,9 @@ if modo_snap and modo_snap in st.session_state.snapshots:
     df_week    = snap_data["df_week"]
     if snap_data.get("act_df") is not None:
         act_df = snap_data["act_df"]
+    # Tipos de actividad congelados al guardar el snapshot.
+    # Snapshots antiguos no los guardaban → la columna no se mostrará.
+    engagement_types = snap_data.get("eng_types") or {}
     week_label = f"📸 SNAPSHOT: {modo_snap}"
 
 # Guardar snapshot si se solicitó
@@ -1255,6 +1263,7 @@ if st.session_state.get("pending_snapshot"):
         "week_label": week_label,
         "df_week":    df_week.copy(),
         "act_df":     act_df.copy(),
+        "eng_types":  dict(engagement_types),
     }
     result = save_snapshots_to_file(st.session_state.snapshots)
     if result is True:
