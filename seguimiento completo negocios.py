@@ -91,6 +91,13 @@ WON_STAGES  = {"990804832", "991037466"}
 LOST_STAGES = {"996161568", "991037467"}
 STALE_DAYS  = [14, 30, 60]
 
+# Zona horaria de España — todas las fechas del dashboard se muestran en hora peninsular
+TZ_ESPANA = "Europe/Madrid"
+
+def ahora_espana():
+    """Fecha y hora actual en España (sin zona horaria, para comparar con los datos)."""
+    return pd.Timestamp.now(tz=TZ_ESPANA).tz_localize(None).to_pydatetime()
+
 # ─────────────────────────────────────────────
 # CLIENTE API HUBSPOT
 # ─────────────────────────────────────────────
@@ -243,7 +250,14 @@ def get_engagement_types(api_key, deal_ids):
     Obtiene el tipo de última actividad por negocio usando el endpoint de engagements.
     Igual que el código de referencia: /engagements/v1/engagements/associated/deal/{id}
     """
-    TIPO_MAP = {"MEETING":"Reunión","EMAIL":"Email","CALL":"Llamada","NOTE":"Nota"}
+    TIPO_MAP = {
+        "MEETING":         "Reunión",
+        "EMAIL":           "Email",
+        "INCOMING_EMAIL":  "Email",   # correos recibidos
+        "FORWARDED_EMAIL": "Email",   # correos reenviados
+        "CALL":            "Llamada",
+        "NOTE":            "Nota",
+    }
     # TASK excluido — las tareas no se consideran actividad real
     results = {}
     for deal_id in deal_ids:
@@ -275,7 +289,8 @@ def parse_dt(val):
     if not val:
         return pd.NaT
     try:
-        return pd.to_datetime(val, utc=True).tz_convert(None)
+        # HubSpot devuelve fechas en UTC — se convierten a hora española
+        return pd.to_datetime(val, utc=True).tz_convert(TZ_ESPANA).tz_localize(None)
     except Exception:
         return pd.NaT
 
@@ -436,10 +451,20 @@ import json
 
 def _snapshots_to_json(snapshots: dict) -> str:
     data = {}
+    date_cols = ["createdate", "closedate", "last_modified", "last_activity_date", "notes_last_updated"]
     for name, snap in snapshots.items():
+        # Marcar las fechas con la zona horaria española antes de guardar,
+        # para que al recargar el snapshot las horas no se desplacen.
+        df_save = snap["df_week"].copy()
+        for col in date_cols:
+            if col in df_save.columns and pd.api.types.is_datetime64_any_dtype(df_save[col]):
+                try:
+                    df_save[col] = df_save[col].dt.tz_localize(TZ_ESPANA, ambiguous="NaT", nonexistent="NaT")
+                except Exception:
+                    pass
         data[name] = {
             "week_label": snap["week_label"],
-            "df_week": snap["df_week"].to_json(date_format="iso"),
+            "df_week": df_save.to_json(date_format="iso"),
             "act_df":  snap["act_df"].to_json(date_format="iso") if snap.get("act_df") is not None else None,
         }
     return json.dumps(data, ensure_ascii=False, indent=2)
@@ -484,10 +509,17 @@ def _json_to_snapshots(raw: str) -> dict:
 
         for col in ["createdate", "closedate", "last_modified", "last_activity_date", "notes_last_updated"]:
             if col in df_week.columns:
-                df_week[col] = pd.to_datetime(df_week[col], utc=True, errors="coerce").dt.tz_convert(None)
-                # Traducir etapas — compatibilidad con snapshots guardados antes de esta corrección
+                df_week[col] = pd.to_datetime(df_week[col], utc=True, errors="coerce").dt.tz_convert(TZ_ESPANA).dt.tz_localize(None)
+
+        # deal_id como texto — evita desajustes str/int al comparar snapshots
+        if "deal_id" in df_week.columns:
+            df_week["deal_id"] = df_week["deal_id"].astype(str).str.replace(r"\.0$", "", regex=True)
+
+        # Traducir etapas — compatibilidad con snapshots guardados antes de esta corrección.
+        # pd.read_json puede convertir los IDs a números (960918614.0), por eso
+        # se normaliza a texto y se elimina el sufijo ".0" antes de mapear.
         if "dealstage" in df_week.columns:
-            df_week["dealstage"] = df_week["dealstage"].astype(str)
+            df_week["dealstage"] = df_week["dealstage"].astype(str).str.replace(r"\.0$", "", regex=True)
             df_week["stage_label"] = df_week["dealstage"].map(STAGE_LABELS).fillna(df_week["dealstage"])
 
         act_df = None
@@ -808,6 +840,7 @@ def xl_sheet_comparativa(wb, snap_a_name, snap_b_name, dfa, dfb, act_a, act_b):
 
     # Tabla unificada
     all_df = pd.concat([dfa, dfb]).drop_duplicates(subset="deal_id").copy()
+    all_df["dealstage"] = all_df["dealstage"].astype(str).str.replace(r"\.0$", "", regex=True)
     all_df["stage_label"] = all_df["dealstage"].map(STAGE_LABELS).fillna(all_df["dealstage"])
     all_df[snap_a_name[:15]] = all_df["deal_id"].apply(lambda x: "SI" if x in ids_a else "NO")
     all_df[snap_b_name[:15]] = all_df["deal_id"].apply(lambda x: "SI" if x in ids_b else "NO")
@@ -1049,14 +1082,20 @@ api_key = HUBSPOT_API_KEY
 
 st.sidebar.title("📊 Pipeline Tracker")
 st.sidebar.caption("Seguimiento semanal de HubSpot")
+
+if st.sidebar.button("🔄 Actualizar datos de HubSpot", use_container_width=True,
+                     help="Descarta la caché y vuelve a descargar todos los datos. La carga tardará más."):
+    st.cache_data.clear()
+    st.rerun()
+
 st.sidebar.divider()
 
 st.sidebar.subheader("Período de análisis")
 col1, col2 = st.sidebar.columns(2)
 with col1:
-    start_date = st.date_input("Desde", value=datetime.now().date() - timedelta(days=7))
+    start_date = st.date_input("Desde", value=ahora_espana().date() - timedelta(days=7))
 with col2:
-    end_date = st.date_input("Hasta", value=datetime.now().date())
+    end_date = st.date_input("Hasta", value=ahora_espana().date())
 
 st.sidebar.divider()
 
@@ -1160,7 +1199,7 @@ if not test_connection(api_key):
 week_start = datetime.combine(start_date, datetime.min.time())
 week_end   = datetime.combine(end_date,   datetime.max.time())
 week_label = f"{start_date.strftime('%d/%m/%Y')} — {end_date.strftime('%d/%m/%Y')}"
-today      = datetime.now()
+today      = ahora_espana()
 
 with st.spinner("Cargando negocios de HubSpot..."):
     df_all = cached_all_deals(api_key)
@@ -1775,8 +1814,17 @@ with tabs[6]:
             all_ids = ids_a | ids_b
             df_all_snap = pd.concat([dfa, dfb]).drop_duplicates(subset="deal_id")
             df_all_snap = df_all_snap[df_all_snap["deal_id"].isin(all_ids)].copy()
-            df_all_snap["dealstage"] = df_all_snap["dealstage"].astype(str)
-            df_all_snap["stage_label"] = df_all_snap["dealstage"].map(STAGE_LABELS).fillna(df_all_snap["dealstage"])
+            df_all_snap["dealstage"] = df_all_snap["dealstage"].astype(str).str.replace(r"\.0$", "", regex=True)
+
+            # Traducir etapas — corrige snapshots antiguos guardados con IDs numéricos
+            if "stage_label" not in df_all_snap.columns or df_all_snap["stage_label"].isna().all():
+                df_all_snap["stage_label"] = df_all_snap["dealstage"].map(STAGE_LABELS).fillna(df_all_snap["dealstage"])
+            else:
+                mask = (
+                    df_all_snap["stage_label"].isna() |
+                    df_all_snap["stage_label"].astype(str).str.match(r'^\d+(\.0)?$', na=False)
+                )
+                df_all_snap.loc[mask, "stage_label"] = df_all_snap.loc[mask, "dealstage"].map(STAGE_LABELS).fillna(df_all_snap.loc[mask, "dealstage"])
 
             df_all_snap[snap_a] = df_all_snap["deal_id"].apply(lambda x: "✅" if x in ids_a else "❌")
             df_all_snap[snap_b] = df_all_snap["deal_id"].apply(lambda x: "✅" if x in ids_b else "❌")
