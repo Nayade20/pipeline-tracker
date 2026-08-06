@@ -264,16 +264,17 @@ def get_engagement_types(api_key, deal_ids):
         url = f"https://api.hubapi.com/engagements/v1/engagements/associated/deal/{deal_id}/paged?limit=100"
         try:
             data = hs_get(api_key, url)
-            ultima, tipo = None, "—"
-            ahora = datetime.now()
+            ultima_ts, tipo = None, "—"
+            # Comparación en epoch ms: no depende de la zona horaria del servidor
+            ahora_ms = int(time.time() * 1000)
             for item in data.get("results", []):
                 eng = item.get("engagement", {})
                 t   = eng.get("type", "")
                 ts  = eng.get("timestamp")
                 if t in TIPO_MAP and ts:
-                    fecha = datetime.fromtimestamp(ts / 1000)
-                    if fecha <= ahora and (not ultima or fecha > ultima):
-                        ultima, tipo = fecha, TIPO_MAP[t]
+                    # Actividades futuras (reuniones agendadas) → no cuentan
+                    if ts <= ahora_ms and (ultima_ts is None or ts > ultima_ts):
+                        ultima_ts, tipo = ts, TIPO_MAP[t]
             results[str(deal_id)] = tipo
         except Exception:
             results[str(deal_id)] = "—"
@@ -466,6 +467,8 @@ def _snapshots_to_json(snapshots: dict) -> str:
             "week_label": snap["week_label"],
             "df_week": df_save.to_json(date_format="iso"),
             "act_df":  snap["act_df"].to_json(date_format="iso") if snap.get("act_df") is not None else None,
+            # Tipo de actividad congelado en el momento de guardar el snapshot
+            "eng_types": snap.get("eng_types") or {},
         }
     return json.dumps(data, ensure_ascii=False, indent=2)
 
@@ -536,6 +539,8 @@ def _json_to_snapshots(raw: str) -> dict:
             "week_label": snap.get("week_label", str(name)),
             "df_week": df_week,
             "act_df": act_df,
+            # Snapshots antiguos no guardaban el tipo de actividad → {}
+            "eng_types": snap.get("eng_types") if isinstance(snap.get("eng_types"), dict) else {},
         }
 
     return snapshots
@@ -1246,6 +1251,9 @@ if modo_snap and modo_snap in st.session_state.snapshots:
     df_week    = snap_data["df_week"]
     if snap_data.get("act_df") is not None:
         act_df = snap_data["act_df"]
+    # Tipos de actividad congelados al guardar el snapshot.
+    # Snapshots antiguos no los guardaban → la columna no se mostrará.
+    engagement_types = snap_data.get("eng_types") or {}
     week_label = f"📸 SNAPSHOT: {modo_snap}"
 
 # Guardar snapshot si se solicitó
@@ -1255,6 +1263,7 @@ if st.session_state.get("pending_snapshot"):
         "week_label": week_label,
         "df_week":    df_week.copy(),
         "act_df":     act_df.copy(),
+        "eng_types":  dict(engagement_types),
     }
     result = save_snapshots_to_file(st.session_state.snapshots)
     if result is True:
@@ -1585,13 +1594,10 @@ with tabs[2]:
             stages_html = ""
             for i, stage in enumerate(stages):
                 if i == 0:
-                    # Primera etapa: naranja (origen)
                     color_bg, color_txt = "#FCE4D6", "#7B3B00"
                 elif i == len(stages) - 1:
-                    # Última etapa: verde (destino final)
                     color_bg, color_txt = "#E2EFDA", "#375623"
                 else:
-                    # Etapas intermedias: azul claro
                     color_bg, color_txt = "#E6F1FB", "#0C447C"
                 stages_html += f'<span style="background:{color_bg};color:{color_txt};padding:3px 10px;border-radius:12px;font-size:12px;white-space:nowrap">{stage}</span>'
                 if i < len(stages) - 1:
@@ -1671,7 +1677,6 @@ with tabs[4]:
             elif val >= 30: return "background-color: #fff3cd; color: #7a5000"
             return ""
 
-        # Tabla global con colores
         show_df = df_stale[["dealname","owner","stage_label","pipeline","days_inactive"]].rename(columns={
             "dealname":"Negocio","owner":"Comercial","stage_label":"Etapa actual",
             "pipeline":"Pipeline","days_inactive":"Días sin actividad",
@@ -1685,7 +1690,6 @@ with tabs[4]:
             hide_index=True, use_container_width=True, height=350,
         )
 
-        # Detalle por comercial
         st.markdown("##### Detalle por comercial")
         for owner_name, grp in df_stale.groupby("owner"):
             with st.expander(f"👤 **{owner_name}** — {len(grp)} negocios estancados"):
@@ -1704,7 +1708,6 @@ with tabs[5]:
     df_heat      = df_heat[df_heat["stage_label"].isin(top_stages)]
     pivot = df_heat.pivot_table(index="owner", columns="stage_label",
                                 values="deal_id", aggfunc="count", fill_value=0)
-    # Añadir fila de totales por etapa
     pivot_total = pivot.copy()
     totals = pivot_total.sum(axis=0)
     totals.name = "TOTAL"
@@ -1724,14 +1727,12 @@ with tabs[5]:
         margin=dict(t=30, b=120, l=150, r=20),
         **PLOT_LAYOUT,
     )
-    # Destacar la fila TOTAL con borde
     fig.add_hline(
         y=len(pivot_with_total) - 1.5,
         line_dash="dash", line_color="#185FA5", line_width=1.5,
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Tabla de totales por etapa debajo
     st.markdown("##### Total negocios por etapa")
     totals_df = pd.DataFrame({
         "Etapa": totals.index,
@@ -1763,10 +1764,9 @@ with tabs[6]:
             sa = st.session_state.snapshots[snap_a]
             sb = st.session_state.snapshots[snap_b]
 
-            # Ordenar automáticamente: A = más antiguo, B = más reciente
             label_a = sa["week_label"]
             label_b = sb["week_label"]
-            if snap_a > snap_b:  # orden alfabético por nombre del snapshot
+            if snap_a > snap_b:
                 sa, sb = sb, sa
                 snap_a, snap_b = snap_b, snap_a
                 label_a, label_b = label_b, label_a
@@ -1777,7 +1777,6 @@ with tabs[6]:
             ids_a = set(dfa["deal_id"])
             ids_b = set(dfb["deal_id"])
 
-            # ── KPIs ─────────────────────────────
             st.divider()
             kc1, kc2, kc3, kc4 = st.columns(4)
             kc1.metric(f"Activos {snap_a}", len(dfa))
@@ -1785,7 +1784,6 @@ with tabs[6]:
             kc3.metric("↑ Suben actividad", len(ids_b - ids_a), help=f"Activos en {snap_b} pero no en {snap_a}")
             kc4.metric("↓ Bajan actividad", len(ids_a - ids_b), help=f"Activos en {snap_a} pero no en {snap_b}")
 
-            # ── Gráfico por comercial ─────────────
             st.divider()
             st.markdown("##### Actividad por comercial")
             act_a = dfa.groupby("owner").size().reset_index(name="n_a")
@@ -1806,17 +1804,14 @@ with tabs[6]:
             fig.update_xaxes(tickangle=-20)
             st.plotly_chart(fig, use_container_width=True)
 
-            # ── Tabla unificada con tendencia ─────
             st.divider()
             st.markdown("##### Detalle de negocios — actividad por período")
 
-            # Unir todos los negocios de ambas semanas
             all_ids = ids_a | ids_b
             df_all_snap = pd.concat([dfa, dfb]).drop_duplicates(subset="deal_id")
             df_all_snap = df_all_snap[df_all_snap["deal_id"].isin(all_ids)].copy()
             df_all_snap["dealstage"] = df_all_snap["dealstage"].astype(str).str.replace(r"\.0$", "", regex=True)
 
-            # Traducir etapas — corrige snapshots antiguos guardados con IDs numéricos
             if "stage_label" not in df_all_snap.columns or df_all_snap["stage_label"].isna().all():
                 df_all_snap["stage_label"] = df_all_snap["dealstage"].map(STAGE_LABELS).fillna(df_all_snap["dealstage"])
             else:
@@ -1841,7 +1836,6 @@ with tabs[6]:
                 "pipeline":    "Pipeline",
             }).sort_values("Tendencia")
 
-            # Filtros rápidos
             tend_filter = st.radio("Filtrar por tendencia:", ["Todos", "✅ Nueva actividad", "📉 Perdió actividad", "🔄 Activo en ambos"], horizontal=True)
             if tend_filter != "Todos":
                 show_comp = show_comp[show_comp["Tendencia"] == tend_filter]
@@ -1871,7 +1865,6 @@ st.caption("Excel con 7 pestañas: resumen, actividad, etapas, cambios, nuevos, 
 
 filename    = f"pipeline_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
 
-# Incluir comparativa en Excel si hay snapshots seleccionados
 comp_excel = None
 snap_keys = list(st.session_state.snapshots.keys())
 if len(snap_keys) >= 2:
