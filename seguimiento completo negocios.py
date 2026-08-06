@@ -968,7 +968,10 @@ def show_deal_table(df, title="Negocios", eng_types=None):
     # Contador incremental para garantizar claves únicas
     _table_counter[0] += 1
     uid = str(_table_counter[0])
-    with st.expander("🔍 Filtros", expanded=False):
+    # Se usa un checkbox en vez de st.expander porque esta tabla puede estar
+    # dentro de otro expander, y Streamlit no permite anidar expanders.
+    ver_filtros = st.checkbox("🔍 Filtros", value=False, key=f"verfiltros_{uid}")
+    if ver_filtros:
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
             buscar = st.text_input("🔎 Buscar negocio", key=f"buscar_{uid}", placeholder="Escribe para buscar...")
@@ -989,6 +992,9 @@ def show_deal_table(df, title="Negocios", eng_types=None):
                 tipo_sel  = st.selectbox("⚡ Tipo actividad", options=tipo_opts, key=f"tipo_{uid}")
             else:
                 tipo_sel = "Todos"
+    else:
+        # Filtros ocultos → valores por defecto (sin filtrar)
+        buscar, owner_sel, etapa_sel, pipe_sel, tipo_sel = "", "Todos", "Todas", "Todos", "Todos"
 
     # Aplicar filtros
     filtered = show.copy()
