@@ -978,38 +978,38 @@ def show_deal_table(df, title="Negocios", eng_types=None):
         with fc1:
             buscar = st.text_input("🔎 Buscar negocio", key=f"buscar_{uid}", placeholder="Escribe para buscar...")
         with fc2:
-            owners_opts = ["Todos"] + sorted(show["Comercial"].dropna().unique().tolist())
-            owner_sel   = st.selectbox("👤 Comercial", options=owners_opts, key=f"owner_{uid}")
+            owners_opts = sorted(show["Comercial"].dropna().unique().tolist())
+            owner_sel   = st.multiselect("👤 Comercial", options=owners_opts, key=f"owner_{uid}", placeholder="Todos")
         with fc3:
-            etapas_opts = ["Todas"] + sorted(show["Etapa"].dropna().unique().tolist())
-            etapa_sel   = st.selectbox("📋 Etapa", options=etapas_opts, key=f"etapa_{uid}")
+            etapas_opts = sorted(show["Etapa"].dropna().unique().tolist())
+            etapa_sel   = st.multiselect("📋 Etapa", options=etapas_opts, key=f"etapa_{uid}", placeholder="Todas")
 
         fc4, fc5 = st.columns(2)
         with fc4:
-            pipe_opts = ["Todos"] + sorted(show["Pipeline"].dropna().unique().tolist())
-            pipe_sel  = st.selectbox("🏗️ Pipeline", options=pipe_opts, key=f"pipe_{uid}")
+            pipe_opts = sorted(show["Pipeline"].dropna().unique().tolist())
+            pipe_sel  = st.multiselect("🏗️ Pipeline", options=pipe_opts, key=f"pipe_{uid}", placeholder="Todos")
         with fc5:
             if "Tipo actividad" in show.columns:
-                tipo_opts = ["Todos"] + sorted(show["Tipo actividad"].dropna().unique().tolist())
-                tipo_sel  = st.selectbox("⚡ Tipo actividad", options=tipo_opts, key=f"tipo_{uid}")
+                tipo_opts = sorted(show["Tipo actividad"].dropna().unique().tolist())
+                tipo_sel  = st.multiselect("⚡ Tipo actividad", options=tipo_opts, key=f"tipo_{uid}", placeholder="Todos")
             else:
-                tipo_sel = "Todos"
+                tipo_sel = []
     else:
         # Filtros ocultos → valores por defecto (sin filtrar)
-        buscar, owner_sel, etapa_sel, pipe_sel, tipo_sel = "", "Todos", "Todas", "Todos", "Todos"
+        buscar, owner_sel, etapa_sel, pipe_sel, tipo_sel = "", [], [], [], []
 
     # Aplicar filtros
     filtered = show.copy()
     if buscar:
         filtered = filtered[filtered["Negocio"].str.contains(buscar, case=False, na=False)]
-    if owner_sel != "Todos":
-        filtered = filtered[filtered["Comercial"] == owner_sel]
-    if etapa_sel != "Todas":
-        filtered = filtered[filtered["Etapa"] == etapa_sel]
-    if pipe_sel != "Todos":
-        filtered = filtered[filtered["Pipeline"] == pipe_sel]
-    if tipo_sel != "Todos" and "Tipo actividad" in filtered.columns:
-        filtered = filtered[filtered["Tipo actividad"] == tipo_sel]
+    if owner_sel:
+        filtered = filtered[filtered["Comercial"].isin(owner_sel)]
+    if etapa_sel:
+        filtered = filtered[filtered["Etapa"].isin(etapa_sel)]
+    if pipe_sel:
+        filtered = filtered[filtered["Pipeline"].isin(pipe_sel)]
+    if tipo_sel and "Tipo actividad" in filtered.columns:
+        filtered = filtered[filtered["Tipo actividad"].isin(tipo_sel)]
 
     st.caption(f"**{len(filtered)}** negocios" + (f" (de {len(show)} totales)" if len(filtered) != len(show) else ""))
     st.dataframe(
