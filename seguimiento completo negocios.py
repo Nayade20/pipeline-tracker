@@ -150,13 +150,14 @@ def get_real_activity(api_key, since_ts_ms, until_ts_ms):
         "emails":   "/crm/v3/objects/emails",
         "meetings": "/crm/v3/objects/meetings",
         "notes":    "/crm/v3/objects/notes",
-        # tasks excluido — no se considera actividad real
+        "tasks":    "/crm/v3/objects/tasks",
     }
     type_props = {
         "calls":    ["hs_timestamp", "hubspot_owner_id"],
         "emails":   ["hs_timestamp", "hubspot_owner_id"],
         "meetings": ["hs_timestamp", "hubspot_owner_id"],
         "notes":    ["hs_timestamp", "hubspot_owner_id"],
+        "tasks":    ["hs_timestamp", "hubspot_owner_id"],
     }
     deal_activity = {}
 
@@ -257,8 +258,8 @@ def get_engagement_types(api_key, deal_ids):
         "FORWARDED_EMAIL": "Email",   # correos reenviados
         "CALL":            "Llamada",
         "NOTE":            "Nota",
+        "TASK":            "Tarea",
     }
-    # TASK excluido — las tareas no se consideran actividad real
     results = {}
     for deal_id in deal_ids:
         url = f"https://api.hubapi.com/engagements/v1/engagements/associated/deal/{deal_id}/paged?limit=100"
@@ -950,6 +951,7 @@ def show_deal_table(df, title="Negocios", eng_types=None):
         "Email":   "📧 Email",
         "Llamada": "📞 Llamada",
         "Nota":    "📝 Nota",
+        "Tarea":   "✅ Tarea",
         "—":       "—",
     }
     if eng_types:
@@ -1167,7 +1169,7 @@ if st.session_state.snapshots:
 
 st.sidebar.divider()
 st.sidebar.caption("🟢 Actividad ≥20%  🟡 10-20%  🔴 <10%")
-st.sidebar.caption("Actividad = notes_last_updated. Tipos: reuniones, emails, llamadas y notas (tareas excluidas).")
+st.sidebar.caption("Actividad = notes_last_updated. Tipos: reuniones, emails, llamadas, notas y tareas.")
 
 # ── Login ──────────────────────────────────────
 
