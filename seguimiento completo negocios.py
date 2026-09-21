@@ -255,11 +255,14 @@ def get_engagement_types(api_key, deal_ids, notes_last_updated_map=None):
     Antes se usaba el endpoint clásico de HubSpot (engagements v1), pero se
     comprobó con varios negocios reales que no siempre acierta con cuál es la
     actividad realmente más reciente (por ejemplo, mostraba "Nota" o "Tarea"
-    cuando en realidad era un email). Por eso ahora se consultan de forma
-    masiva y fiable (API v3/v4, la misma que usa get_real_activity) las
-    llamadas, emails, reuniones, notas y tareas asociadas a los negocios, y
-    para cada uno se elige el tipo cuya fecha coincide con la que se muestra
-    en "Última actividad".
+    cuando en realidad era un email). Después se probó a listar todo el
+    historial de actividades y filtrar por fecha aquí mismo, pero con una
+    cuenta de HubSpot con miles de emails/notas eso es demasiado lento y se
+    queda a medias. Por eso ahora se usa el BUSCADOR de HubSpot (Search API),
+    que permite pedirle directamente solo las actividades dentro del rango de
+    fechas que nos interesa — mucho más rápido y fiable — y para cada negocio
+    se elige el tipo cuya fecha coincide con la que se muestra en "Última
+    actividad".
 
     notes_last_updated_map: diccionario {deal_id (str): epoch_ms} con la fecha
     de "Última actividad" real de cada negocio (el mismo valor que se muestra
@@ -276,27 +279,39 @@ def get_engagement_types(api_key, deal_ids, notes_last_updated_map=None):
     # fuera del rango de búsqueda.
     since_ts_ms = min(notes_last_updated_map.values()) - 3 * 24 * 60 * 60 * 1000
 
-    activity_endpoints = {
-        "calls":    (f"{BASE_URL}/crm/v3/objects/calls",    "Llamada"),
-        "emails":   (f"{BASE_URL}/crm/v3/objects/emails",   "Email"),
-        "meetings": (f"{BASE_URL}/crm/v3/objects/meetings", "Reunión"),
-        "notes":    (f"{BASE_URL}/crm/v3/objects/notes",    "Nota"),
-        "tasks":    (f"{BASE_URL}/crm/v3/objects/tasks",    "Tarea"),
+    activity_types = {
+        "calls":    "Llamada",
+        "emails":   "Email",
+        "meetings": "Reunión",
+        "notes":    "Nota",
+        "tasks":    "Tarea",
     }
 
     # deal_type_ts[deal_id][tipo_label] = fecha más reciente encontrada de ese tipo
     deal_type_ts = {}
 
-    for act_type, (url, tipo_label) in activity_endpoints.items():
-        # 1. Recoger actividades de este tipo dentro del rango de fechas
-        item_ts = {}
-        after = None
+    for act_type, tipo_label in activity_types.items():
+        # 1. Buscar actividades de este tipo dentro del rango de fechas
+        #    (usando el buscador de HubSpot, no listando todo el historial)
+        item_ts    = {}
+        search_url = f"{BASE_URL}/crm/v3/objects/{act_type}/search"
+        after      = None
         while True:
-            params = {"limit": 100, "properties": "hs_timestamp"}
+            payload = {
+                "filterGroups": [{
+                    "filters": [
+                        {"propertyName": "hs_timestamp", "operator": "GTE", "value": str(since_ts_ms)},
+                        {"propertyName": "hs_timestamp", "operator": "LTE", "value": str(ahora_ms)},
+                    ]
+                }],
+                "properties": ["hs_timestamp"],
+                "limit": 100,
+                "sorts": [{"propertyName": "hs_timestamp", "direction": "DESCENDING"}],
+            }
             if after:
-                params["after"] = after
+                payload["after"] = after
             try:
-                data = hs_get(api_key, url, params)
+                data = hs_post(api_key, search_url, payload)
             except Exception:
                 break
             for item in data.get("results", []):
@@ -307,8 +322,7 @@ def get_engagement_types(api_key, deal_ids, notes_last_updated_map=None):
                     ts_ms = int(pd.to_datetime(ts_raw, utc=True).timestamp() * 1000)
                 except Exception:
                     continue
-                if since_ts_ms <= ts_ms <= ahora_ms:
-                    item_ts[item["id"]] = ts_ms
+                item_ts[item["id"]] = ts_ms
             paging = data.get("paging", {})
             after  = paging.get("next", {}).get("after")
             if not after:
