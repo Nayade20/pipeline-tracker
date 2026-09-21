@@ -303,6 +303,11 @@ def get_engagement_types(api_key, deal_ids, notes_last_updated_map=None):
     deal_activity_ids = {}
     # activity_ts[(act_type, activity_id)] = fecha (hs_timestamp) de esa actividad
     activity_ts = {}
+    # errores_tipo[tipo_label] = primer mensaje de error visto para ese tipo,
+    # por si HubSpot rechaza la petición (p. ej. por falta de permisos en la
+    # API Key). Se enseña luego en la pantalla como aviso, para poder
+    # diagnosticar sin necesidad de mirar el código.
+    errores_tipo = {}
 
     for act_type, tipo_label in activity_types.items():
         # 1. Preguntar, para NUESTROS negocios, qué actividades de este tipo
@@ -314,7 +319,10 @@ def get_engagement_types(api_key, deal_ids, notes_last_updated_map=None):
             payload = {"inputs": [{"id": d} for d in batch]}
             try:
                 data = hs_post(api_key, assoc_url, payload)
-            except Exception:
+            except Exception as e:
+                if tipo_label not in errores_tipo:
+                    detalle = getattr(getattr(e, "response", None), "text", "") or str(e)
+                    errores_tipo[tipo_label] = f"asociaciones negocio→{act_type}: {detalle[:300]}"
                 continue
             for result in data.get("results", []):
                 deal_id = str(result.get("from", {}).get("id", ""))
@@ -337,7 +345,10 @@ def get_engagement_types(api_key, deal_ids, notes_last_updated_map=None):
             payload = {"properties": ["hs_timestamp"], "inputs": [{"id": aid} for aid in batch]}
             try:
                 data = hs_post(api_key, batch_url, payload)
-            except Exception:
+            except Exception as e:
+                if tipo_label not in errores_tipo:
+                    detalle = getattr(getattr(e, "response", None), "text", "") or str(e)
+                    errores_tipo[tipo_label] = f"detalle de {act_type}: {detalle[:300]}"
                 continue
             for item in data.get("results", []):
                 ts_raw = item.get("properties", {}).get("hs_timestamp")
@@ -349,6 +360,13 @@ def get_engagement_types(api_key, deal_ids, notes_last_updated_map=None):
                     continue
                 activity_ts[(act_type, item["id"])] = ts_ms
             time.sleep(0.1)
+
+    # Guardamos los errores (si los hay) para poder mostrarlos como aviso en
+    # pantalla — así se puede ver el motivo exacto sin tocar el código.
+    try:
+        st.session_state["_engagement_debug_errors"] = errores_tipo
+    except Exception:
+        pass
 
     # 3. Para cada negocio, elegir el tipo cuya fecha coincide con "Última actividad"
     results = {}
@@ -374,11 +392,14 @@ def get_engagement_types(api_key, deal_ids, notes_last_updated_map=None):
             if abs(ts - notes_ts) <= TOLERANCIA_MS:
                 coincide = tipo
                 break
-        if coincide:
-            results[deal_id] = coincide
-        else:
-            # Sin coincidencia exacta: se usa el tipo más reciente encontrado
-            results[deal_id] = max(tipos.items(), key=lambda x: x[1])[0]
+        # IMPORTANTE: si ningún tipo coincide EXACTAMENTE (con el margen de
+        # tolerancia) con la fecha de "Última actividad", se muestra "—" en
+        # vez de "adivinar" cogiendo el tipo más reciente encontrado. Antes
+        # se hacía esa suposición y, cuando fallaba la detección de un tipo
+        # (por ejemplo Email o Llamada), el negocio se quedaba mostrando
+        # "Tarea" de forma incorrecta con solo con que hubiera una tarea
+        # cualquiera asociada. Mejor decir "no lo sé" que decir algo mal.
+        results[deal_id] = coincide if coincide else "—"
     return results
 
 
@@ -1356,6 +1377,14 @@ if not df_week.empty:
     notes_ts_tuple = tuple(sorted(notes_ts_map.items()))
     with st.spinner(f"Cargando tipo de actividad para {len(df_week)} negocios..."):
         engagement_types = cached_engagement_types(api_key, tuple(df_week["deal_id"].tolist()), notes_ts_tuple)
+    # Aviso técnico temporal: si HubSpot ha rechazado alguna petición (por
+    # ejemplo por falta de permisos en la API Key para leer Emails o
+    # Llamadas), se enseña aquí el motivo exacto para poder diagnosticarlo.
+    _debug_errors = st.session_state.get("_engagement_debug_errors")
+    if _debug_errors:
+        with st.expander("⚠️ Aviso técnico: algún tipo de actividad no se ha podido leer (pulsa para ver el detalle)"):
+            for _tipo, _msg in _debug_errors.items():
+                st.write(f"**{_tipo}**: {_msg}")
     rows = []
     for _, row in df_week.iterrows():
         tipo = engagement_types.get(str(row["deal_id"]), "—")
