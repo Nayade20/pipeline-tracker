@@ -147,11 +147,11 @@ def get_real_activity(api_key, since_ts_ms, until_ts_ms):
     Devuelve: {deal_id: {"owner_id": str, "types": set}}
     """
     activity_endpoints = {
-        "calls":    "/crm/v3/objects/calls",
-        "emails":   "/crm/v3/objects/emails",
-        "meetings": "/crm/v3/objects/meetings",
-        "notes":    "/crm/v3/objects/notes",
-        "tasks":    "/crm/v3/objects/tasks",
+        "calls":    f"{BASE_URL}/crm/v3/objects/calls",
+        "emails":   f"{BASE_URL}/crm/v3/objects/emails",
+        "meetings": f"{BASE_URL}/crm/v3/objects/meetings",
+        "notes":    f"{BASE_URL}/crm/v3/objects/notes",
+        "tasks":    f"{BASE_URL}/crm/v3/objects/tasks",
     }
     type_props = {
         "calls":    ["hs_timestamp", "hubspot_owner_id"],
@@ -249,105 +249,118 @@ def get_stage_history_bulk(api_key, deal_ids):
 
 def get_engagement_types(api_key, deal_ids, notes_last_updated_map=None):
     """
-    Obtiene el tipo de última actividad por negocio usando el endpoint de engagements.
-    Igual que el código de referencia: /engagements/v1/engagements/associated/deal/{id}
+    Determina, para cada negocio, qué tipo de actividad corresponde a su fecha
+    de "Última actividad" (notes_last_updated).
 
-    notes_last_updated_map: diccionario opcional {deal_id (str): epoch_ms} con la
-    fecha de "Última actividad" real de cada negocio — el mismo valor que se
-    muestra en la columna "Última actividad" del panel (viene del campo
-    notes_last_updated de HubSpot). Se usa SOLO para corregir el tipo a "Tarea"
-    cuando esa fecha coincide (con un pequeño margen) con el vencimiento de una
-    tarea del negocio. No se corrige "porque el negocio tenga alguna tarea
-    antigua asociada" — solo cuando la tarea es, de verdad, la actividad que
-    corresponde a la fecha que se está mostrando.
+    Antes se usaba el endpoint clásico de HubSpot (engagements v1), pero se
+    comprobó con varios negocios reales que no siempre acierta con cuál es la
+    actividad realmente más reciente (por ejemplo, mostraba "Nota" o "Tarea"
+    cuando en realidad era un email). Por eso ahora se consultan de forma
+    masiva y fiable (API v3/v4, la misma que usa get_real_activity) las
+    llamadas, emails, reuniones, notas y tareas asociadas a los negocios, y
+    para cada uno se elige el tipo cuya fecha coincide con la que se muestra
+    en "Última actividad".
+
+    notes_last_updated_map: diccionario {deal_id (str): epoch_ms} con la fecha
+    de "Última actividad" real de cada negocio (el mismo valor que se muestra
+    en el panel). Es necesario para poder saber qué tipo corresponde a esa
+    fecha — sin él, se devuelve "—" para todos los negocios.
     """
-    TIPO_MAP = {
-        "MEETING":         "Reunión",
-        "EMAIL":           "Email",
-        "INCOMING_EMAIL":  "Email",   # correos recibidos
-        "FORWARDED_EMAIL": "Email",   # correos reenviados
-        "CALL":            "Llamada",
-        "NOTE":            "Nota",
-        "TASK":            "Tarea",
+    if not notes_last_updated_map:
+        return {str(d): "—" for d in deal_ids}
+
+    TOLERANCIA_MS = 2 * 60 * 1000  # 2 minutos de margen, por posibles redondeos
+    ahora_ms      = int(time.time() * 1000)
+    # Margen de seguridad: unos días antes de la fecha más antigua que haya
+    # que comprobar, para no perder ninguna actividad por quedarse justo
+    # fuera del rango de búsqueda.
+    since_ts_ms = min(notes_last_updated_map.values()) - 3 * 24 * 60 * 60 * 1000
+
+    activity_endpoints = {
+        "calls":    (f"{BASE_URL}/crm/v3/objects/calls",    "Llamada"),
+        "emails":   (f"{BASE_URL}/crm/v3/objects/emails",   "Email"),
+        "meetings": (f"{BASE_URL}/crm/v3/objects/meetings", "Reunión"),
+        "notes":    (f"{BASE_URL}/crm/v3/objects/notes",    "Nota"),
+        "tasks":    (f"{BASE_URL}/crm/v3/objects/tasks",    "Tarea"),
     }
-    results  = {}
-    # Comparación en epoch ms: no depende de la zona horaria del servidor
-    ahora_ms = int(time.time() * 1000)
 
-    for deal_id in deal_ids:
-        url = f"https://api.hubapi.com/engagements/v1/engagements/associated/deal/{deal_id}/paged?limit=100"
-        try:
-            data = hs_get(api_key, url)
-            ultima_ts, tipo = None, "—"
+    # deal_type_ts[deal_id][tipo_label] = fecha más reciente encontrada de ese tipo
+    deal_type_ts = {}
+
+    for act_type, (url, tipo_label) in activity_endpoints.items():
+        # 1. Recoger actividades de este tipo dentro del rango de fechas
+        item_ts = {}
+        after = None
+        while True:
+            params = {"limit": 100, "properties": "hs_timestamp"}
+            if after:
+                params["after"] = after
+            try:
+                data = hs_get(api_key, url, params)
+            except Exception:
+                break
             for item in data.get("results", []):
-                eng = item.get("engagement", {})
-                t   = eng.get("type", "")
-                ts  = eng.get("timestamp")
-                if t in TIPO_MAP and ts:
-                    # Actividades futuras (reuniones agendadas) → no cuentan
-                    if ts <= ahora_ms and (ultima_ts is None or ts > ultima_ts):
-                        ultima_ts, tipo = ts, TIPO_MAP[t]
-            results[str(deal_id)] = tipo
-        except Exception:
-            results[str(deal_id)] = "—"
-        time.sleep(0.1)
-
-    # ── Corrección de tareas ──────────────────────────────────
-    # Solo se marca "Tarea" cuando el vencimiento de una tarea del negocio
-    # coincide (con un margen de 2 minutos, por posibles redondeos) con la
-    # fecha real de "Última actividad" (notes_last_updated). Así evitamos
-    # marcar "Tarea" solo por tener alguna tarea antigua asociada, que no
-    # tiene nada que ver con la actividad más reciente.
-    if notes_last_updated_map:
-        try:
-            deal_ids_str     = [str(d) for d in deal_ids if str(d) in notes_last_updated_map]
-            task_ids_by_deal = {}
-            for i in range(0, len(deal_ids_str), 100):
-                batch = deal_ids_str[i:i + 100]
-                payload = {"inputs": [{"id": did} for did in batch]}
-                assoc_url = f"{BASE_URL}/crm/v4/associations/deals/tasks/batch/read"
-                try:
-                    assoc_data = hs_post(api_key, assoc_url, payload)
-                    for result in assoc_data.get("results", []):
-                        from_id  = str(result.get("from", {}).get("id", ""))
-                        task_ids = [str(a.get("toObjectId") or a.get("id", "")) for a in result.get("to", [])]
-                        if task_ids:
-                            task_ids_by_deal[from_id] = task_ids
-                except Exception:
-                    pass
-                time.sleep(0.15)
-
-            all_task_ids = sorted({tid for ids in task_ids_by_deal.values() for tid in ids})
-            task_timestamps = {}
-            for i in range(0, len(all_task_ids), 100):
-                batch = all_task_ids[i:i + 100]
-                payload = {"inputs": [{"id": tid} for tid in batch], "properties": ["hs_timestamp"]}
-                try:
-                    data = hs_post(api_key, f"{BASE_URL}/crm/v3/objects/tasks/batch/read", payload)
-                    for item in data.get("results", []):
-                        ts_raw = item.get("properties", {}).get("hs_timestamp")
-                        if ts_raw:
-                            try:
-                                task_timestamps[item["id"]] = int(pd.to_datetime(ts_raw, utc=True).timestamp() * 1000)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-                time.sleep(0.15)
-
-            TOLERANCIA_MS = 2 * 60 * 1000  # 2 minutos de margen
-            for deal_id, task_ids in task_ids_by_deal.items():
-                notes_ts = notes_last_updated_map.get(deal_id)
-                if notes_ts is None:
+                ts_raw = item.get("properties", {}).get("hs_timestamp")
+                if not ts_raw:
                     continue
-                for tid in task_ids:
-                    ts = task_timestamps.get(tid)
-                    if ts is not None and abs(ts - notes_ts) <= TOLERANCIA_MS:
-                        results[deal_id] = "Tarea"
-                        break
-        except Exception:
-            pass
+                try:
+                    ts_ms = int(pd.to_datetime(ts_raw, utc=True).timestamp() * 1000)
+                except Exception:
+                    continue
+                if since_ts_ms <= ts_ms <= ahora_ms:
+                    item_ts[item["id"]] = ts_ms
+            paging = data.get("paging", {})
+            after  = paging.get("next", {}).get("after")
+            if not after:
+                break
+            time.sleep(0.1)
 
+        if not item_ts:
+            continue
+
+        # 2. Asociar cada actividad encontrada con sus negocios
+        ids = list(item_ts.keys())
+        for i in range(0, len(ids), 100):
+            batch = ids[i:i + 100]
+            assoc_url = f"{BASE_URL}/crm/v4/associations/{act_type}/deals/batch/read"
+            payload = {"inputs": [{"id": aid} for aid in batch]}
+            try:
+                assoc_data = hs_post(api_key, assoc_url, payload)
+                for result in assoc_data.get("results", []):
+                    act_id = str(result.get("from", {}).get("id", ""))
+                    ts     = item_ts.get(act_id)
+                    if ts is None:
+                        continue
+                    for assoc in result.get("to", []):
+                        deal_id = str(assoc.get("toObjectId") or assoc.get("id", ""))
+                        if deal_id not in deal_type_ts:
+                            deal_type_ts[deal_id] = {}
+                        prev = deal_type_ts[deal_id].get(tipo_label)
+                        if prev is None or ts > prev:
+                            deal_type_ts[deal_id][tipo_label] = ts
+            except Exception:
+                pass
+            time.sleep(0.15)
+
+    # 3. Para cada negocio, elegir el tipo cuya fecha coincide con "Última actividad"
+    results = {}
+    for deal_id in deal_ids:
+        deal_id  = str(deal_id)
+        notes_ts = notes_last_updated_map.get(deal_id)
+        tipos    = deal_type_ts.get(deal_id, {})
+        if notes_ts is None or not tipos:
+            results[deal_id] = "—"
+            continue
+        coincide = None
+        for tipo, ts in tipos.items():
+            if abs(ts - notes_ts) <= TOLERANCIA_MS:
+                coincide = tipo
+                break
+        if coincide:
+            results[deal_id] = coincide
+        else:
+            # Sin coincidencia exacta: se usa el tipo más reciente encontrado
+            results[deal_id] = max(tipos.items(), key=lambda x: x[1])[0]
     return results
 
 
