@@ -251,6 +251,16 @@ def get_engagement_types(api_key, deal_ids):
     """
     Obtiene el tipo de última actividad por negocio usando el endpoint de engagements.
     Igual que el código de referencia: /engagements/v1/engagements/associated/deal/{id}
+
+    NOTA: el endpoint clásico de engagements no siempre refleja bien la fecha de
+    vencimiento de una tarea. HubSpot sí usa esa fecha para actualizar
+    "notes_last_updated" (el campo que este dashboard muestra como "Última
+    actividad"), así que si no se corrige, puede aparecer una fecha de tarea
+    en la columna "Última actividad" junto con otro tipo (ej. "Email") en
+    "Tipo actividad". Por eso, después de calcular el tipo con el método
+    clásico, se comprueban aparte las tareas asociadas a cada negocio (vía la
+    API v3/v4, que sí da la fecha de vencimiento de forma fiable) y, si su
+    fecha es más reciente que lo encontrado, se corrige el tipo a "Tarea".
     """
     TIPO_MAP = {
         "MEETING":         "Reunión",
@@ -261,14 +271,16 @@ def get_engagement_types(api_key, deal_ids):
         "NOTE":            "Nota",
         "TASK":            "Tarea",
     }
-    results = {}
+    results       = {}
+    ultima_ts_map = {}
+    # Comparación en epoch ms: no depende de la zona horaria del servidor
+    ahora_ms = int(time.time() * 1000)
+
     for deal_id in deal_ids:
         url = f"https://api.hubapi.com/engagements/v1/engagements/associated/deal/{deal_id}/paged?limit=100"
         try:
             data = hs_get(api_key, url)
             ultima_ts, tipo = None, "—"
-            # Comparación en epoch ms: no depende de la zona horaria del servidor
-            ahora_ms = int(time.time() * 1000)
             for item in data.get("results", []):
                 eng = item.get("engagement", {})
                 t   = eng.get("type", "")
@@ -277,10 +289,64 @@ def get_engagement_types(api_key, deal_ids):
                     # Actividades futuras (reuniones agendadas) → no cuentan
                     if ts <= ahora_ms and (ultima_ts is None or ts > ultima_ts):
                         ultima_ts, tipo = ts, TIPO_MAP[t]
-            results[str(deal_id)] = tipo
+            results[str(deal_id)]       = tipo
+            ultima_ts_map[str(deal_id)] = ultima_ts
         except Exception:
-            results[str(deal_id)] = "—"
+            results[str(deal_id)]       = "—"
+            ultima_ts_map[str(deal_id)] = None
         time.sleep(0.1)
+
+    # ── Corrección de tareas ──────────────────────────────────
+    try:
+        deal_ids_str  = [str(d) for d in deal_ids]
+        task_ids_by_deal = {}
+        for i in range(0, len(deal_ids_str), 100):
+            batch = deal_ids_str[i:i + 100]
+            payload = {"inputs": [{"id": did} for did in batch]}
+            assoc_url = f"{BASE_URL}/crm/v4/associations/deals/tasks/batch/read"
+            try:
+                assoc_data = hs_post(api_key, assoc_url, payload)
+                for result in assoc_data.get("results", []):
+                    from_id  = str(result.get("from", {}).get("id", ""))
+                    task_ids = [str(a.get("toObjectId") or a.get("id", "")) for a in result.get("to", [])]
+                    if task_ids:
+                        task_ids_by_deal[from_id] = task_ids
+            except Exception:
+                pass
+            time.sleep(0.15)
+
+        all_task_ids = sorted({tid for ids in task_ids_by_deal.values() for tid in ids})
+        task_timestamps = {}
+        for i in range(0, len(all_task_ids), 100):
+            batch = all_task_ids[i:i + 100]
+            payload = {"inputs": [{"id": tid} for tid in batch], "properties": ["hs_timestamp"]}
+            try:
+                data = hs_post(api_key, f"{BASE_URL}/crm/v3/objects/tasks/batch/read", payload)
+                for item in data.get("results", []):
+                    ts_raw = item.get("properties", {}).get("hs_timestamp")
+                    if ts_raw:
+                        try:
+                            task_timestamps[item["id"]] = int(pd.to_datetime(ts_raw, utc=True).timestamp() * 1000)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            time.sleep(0.15)
+
+        for deal_id, task_ids in task_ids_by_deal.items():
+            max_task_ts = None
+            for tid in task_ids:
+                ts = task_timestamps.get(tid)
+                if ts and ts <= ahora_ms and (max_task_ts is None or ts > max_task_ts):
+                    max_task_ts = ts
+            if max_task_ts is not None:
+                ultima = ultima_ts_map.get(deal_id)
+                if ultima is None or max_task_ts > ultima:
+                    results[deal_id]       = "Tarea"
+                    ultima_ts_map[deal_id] = max_task_ts
+    except Exception:
+        pass
+
     return results
 
 
@@ -1148,6 +1214,7 @@ if st.sidebar.button("💾 Guardar snapshot actual", use_container_width=True):
 
 if st.session_state.get("ftp_load_error"):
     st.sidebar.warning(f"⚠️ Error al cargar FTP: {st.session_state['ftp_load_error']}")
+
 if st.session_state.snapshots:
     st.sidebar.caption(f"📁 {len(st.session_state.snapshots)} snapshot(s) guardado(s):")
     for sn in list(st.session_state.snapshots.keys()):
