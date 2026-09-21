@@ -252,17 +252,32 @@ def get_engagement_types(api_key, deal_ids, notes_last_updated_map=None):
     Determina, para cada negocio, qué tipo de actividad corresponde a su fecha
     de "Última actividad" (notes_last_updated).
 
-    Antes se usaba el endpoint clásico de HubSpot (engagements v1), pero se
-    comprobó con varios negocios reales que no siempre acierta con cuál es la
-    actividad realmente más reciente (por ejemplo, mostraba "Nota" o "Tarea"
-    cuando en realidad era un email). Después se probó a listar todo el
-    historial de actividades y filtrar por fecha aquí mismo, pero con una
-    cuenta de HubSpot con miles de emails/notas eso es demasiado lento y se
-    queda a medias. Por eso ahora se usa el BUSCADOR de HubSpot (Search API),
-    que permite pedirle directamente solo las actividades dentro del rango de
-    fechas que nos interesa — mucho más rápido y fiable — y para cada negocio
-    se elige el tipo cuya fecha coincide con la que se muestra en "Última
-    actividad".
+    Historial de intentos anteriores (por si hace falta recordar por qué está
+    hecho así):
+    1) Endpoint clásico de HubSpot (engagements v1): no siempre acertaba con
+       la actividad realmente más reciente (mostraba "Nota" o "Tarea" cuando
+       en realidad era un email).
+    2) Listar TODO el historial de actividades de la cuenta y filtrar por
+       fecha aquí mismo: con miles de emails/notas era demasiado lento y se
+       quedaba a medias.
+    3) Buscar en HubSpot (Search API) solo las actividades dentro de un rango
+       de fechas de toda la cuenta, y luego mirar a qué negocio pertenecía
+       cada una: comprobado con datos reales que, con cuentas grandes,
+       HubSpot puede no devolver todas las actividades del rango (demasiadas
+       páginas / límites de la API), así que algunas actividades —sobre todo
+       emails, que son las más numerosas— se perdían y el negocio se quedaba
+       sin ese dato (aparecía "—" o el tipo equivocado, por ejemplo "Tarea"
+       cuando la última actividad real era un email).
+
+    Solución actual (4): en vez de preguntar "¿qué actividades hay en este
+    rango de fechas, en toda la cuenta?", se pregunta directamente
+    "¿qué actividades tiene ASOCIADAS cada uno de estos negocios?" — mismo
+    enfoque que usa la propia pantalla de HubSpot al abrir un negocio. Al
+    partir de la lista (pequeña) de negocios en vez de la lista (enorme) de
+    actividades de toda la cuenta, no hace falta limitar por fechas ni hay
+    riesgo de que se queden actividades sin descargar. Comprobado con datos
+    reales de varios negocios: la fecha del email/nota/tarea asociado
+    coincide exactamente (al milisegundo) con "Última actividad".
 
     notes_last_updated_map: diccionario {deal_id (str): epoch_ms} con la fecha
     de "Última actividad" real de cada negocio (el mismo valor que se muestra
@@ -273,11 +288,6 @@ def get_engagement_types(api_key, deal_ids, notes_last_updated_map=None):
         return {str(d): "—" for d in deal_ids}
 
     TOLERANCIA_MS = 2 * 60 * 1000  # 2 minutos de margen, por posibles redondeos
-    ahora_ms      = int(time.time() * 1000)
-    # Margen de seguridad: unos días antes de la fecha más antigua que haya
-    # que comprobar, para no perder ninguna actividad por quedarse justo
-    # fuera del rango de búsqueda.
-    since_ts_ms = min(notes_last_updated_map.values()) - 3 * 24 * 60 * 60 * 1000
 
     activity_types = {
         "calls":    "Llamada",
@@ -287,33 +297,48 @@ def get_engagement_types(api_key, deal_ids, notes_last_updated_map=None):
         "tasks":    "Tarea",
     }
 
-    # deal_type_ts[deal_id][tipo_label] = fecha más reciente encontrada de ese tipo
-    deal_type_ts = {}
+    deal_ids_str = [str(d) for d in deal_ids]
+
+    # deal_activity_ids[deal_id][tipo_label] = [ids de actividades de ese tipo asociadas]
+    deal_activity_ids = {}
+    # activity_ts[(act_type, activity_id)] = fecha (hs_timestamp) de esa actividad
+    activity_ts = {}
 
     for act_type, tipo_label in activity_types.items():
-        # 1. Buscar actividades de este tipo dentro del rango de fechas
-        #    (usando el buscador de HubSpot, no listando todo el historial)
-        item_ts    = {}
-        search_url = f"{BASE_URL}/crm/v3/objects/{act_type}/search"
-        after      = None
-        while True:
-            payload = {
-                "filterGroups": [{
-                    "filters": [
-                        {"propertyName": "hs_timestamp", "operator": "GTE", "value": str(since_ts_ms)},
-                        {"propertyName": "hs_timestamp", "operator": "LTE", "value": str(ahora_ms)},
-                    ]
-                }],
-                "properties": ["hs_timestamp"],
-                "limit": 100,
-                "sorts": [{"propertyName": "hs_timestamp", "direction": "DESCENDING"}],
-            }
-            if after:
-                payload["after"] = after
+        # 1. Preguntar, para NUESTROS negocios, qué actividades de este tipo
+        #    tienen asociadas (en vez de buscar entre todas las de la cuenta).
+        activity_ids_needed = set()
+        assoc_url = f"{BASE_URL}/crm/v4/associations/deals/{act_type}/batch/read"
+        for i in range(0, len(deal_ids_str), 100):
+            batch   = deal_ids_str[i:i + 100]
+            payload = {"inputs": [{"id": d} for d in batch]}
             try:
-                data = hs_post(api_key, search_url, payload)
+                data = hs_post(api_key, assoc_url, payload)
             except Exception:
-                break
+                continue
+            for result in data.get("results", []):
+                deal_id = str(result.get("from", {}).get("id", ""))
+                for assoc in result.get("to", []):
+                    act_id = str(assoc.get("toObjectId") or assoc.get("id", ""))
+                    if not act_id:
+                        continue
+                    deal_activity_ids.setdefault(deal_id, {}).setdefault(tipo_label, []).append(act_id)
+                    activity_ids_needed.add(act_id)
+            time.sleep(0.1)
+
+        if not activity_ids_needed:
+            continue
+
+        # 2. Traer la fecha (hs_timestamp) de cada actividad encontrada
+        ids       = list(activity_ids_needed)
+        batch_url = f"{BASE_URL}/crm/v3/objects/{act_type}/batch/read"
+        for i in range(0, len(ids), 100):
+            batch   = ids[i:i + 100]
+            payload = {"properties": ["hs_timestamp"], "inputs": [{"id": aid} for aid in batch]}
+            try:
+                data = hs_post(api_key, batch_url, payload)
+            except Exception:
+                continue
             for item in data.get("results", []):
                 ts_raw = item.get("properties", {}).get("hs_timestamp")
                 if not ts_raw:
@@ -322,46 +347,25 @@ def get_engagement_types(api_key, deal_ids, notes_last_updated_map=None):
                     ts_ms = int(pd.to_datetime(ts_raw, utc=True).timestamp() * 1000)
                 except Exception:
                     continue
-                item_ts[item["id"]] = ts_ms
-            paging = data.get("paging", {})
-            after  = paging.get("next", {}).get("after")
-            if not after:
-                break
+                activity_ts[(act_type, item["id"])] = ts_ms
             time.sleep(0.1)
-
-        if not item_ts:
-            continue
-
-        # 2. Asociar cada actividad encontrada con sus negocios
-        ids = list(item_ts.keys())
-        for i in range(0, len(ids), 100):
-            batch = ids[i:i + 100]
-            assoc_url = f"{BASE_URL}/crm/v4/associations/{act_type}/deals/batch/read"
-            payload = {"inputs": [{"id": aid} for aid in batch]}
-            try:
-                assoc_data = hs_post(api_key, assoc_url, payload)
-                for result in assoc_data.get("results", []):
-                    act_id = str(result.get("from", {}).get("id", ""))
-                    ts     = item_ts.get(act_id)
-                    if ts is None:
-                        continue
-                    for assoc in result.get("to", []):
-                        deal_id = str(assoc.get("toObjectId") or assoc.get("id", ""))
-                        if deal_id not in deal_type_ts:
-                            deal_type_ts[deal_id] = {}
-                        prev = deal_type_ts[deal_id].get(tipo_label)
-                        if prev is None or ts > prev:
-                            deal_type_ts[deal_id][tipo_label] = ts
-            except Exception:
-                pass
-            time.sleep(0.15)
 
     # 3. Para cada negocio, elegir el tipo cuya fecha coincide con "Última actividad"
     results = {}
-    for deal_id in deal_ids:
-        deal_id  = str(deal_id)
-        notes_ts = notes_last_updated_map.get(deal_id)
-        tipos    = deal_type_ts.get(deal_id, {})
+    for deal_id in deal_ids_str:
+        notes_ts  = notes_last_updated_map.get(deal_id)
+        tipos_ids = deal_activity_ids.get(deal_id, {})
+
+        tipos = {}
+        for act_type, tipo_label in activity_types.items():
+            mejor_ts = None
+            for act_id in tipos_ids.get(tipo_label, []):
+                ts = activity_ts.get((act_type, act_id))
+                if ts is not None and (mejor_ts is None or ts > mejor_ts):
+                    mejor_ts = ts
+            if mejor_ts is not None:
+                tipos[tipo_label] = mejor_ts
+
         if notes_ts is None or not tipos:
             results[deal_id] = "—"
             continue
