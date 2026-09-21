@@ -387,11 +387,15 @@ def get_engagement_types(api_key, deal_ids, notes_last_updated_map=None):
         if notes_ts is None or not tipos:
             results[deal_id] = "—"
             continue
-        coincide = None
+        # Si varias actividades caen dentro del margen de tolerancia (p. ej.
+        # una nota y un email casi al mismo minuto), nos quedamos con la que
+        # coincide MÁS EXACTAMENTE (menor diferencia), no con la primera que
+        # se encuentre al recorrer los tipos.
+        coincide, mejor_diff = None, None
         for tipo, ts in tipos.items():
-            if abs(ts - notes_ts) <= TOLERANCIA_MS:
-                coincide = tipo
-                break
+            diff = abs(ts - notes_ts)
+            if diff <= TOLERANCIA_MS and (mejor_diff is None or diff < mejor_diff):
+                coincide, mejor_diff = tipo, diff
         # IMPORTANTE: si ningún tipo coincide EXACTAMENTE (con el margen de
         # tolerancia) con la fecha de "Última actividad", se muestra "—" en
         # vez de "adivinar" cogiendo el tipo más reciente encontrado. Antes
