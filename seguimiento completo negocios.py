@@ -67,16 +67,22 @@ STAGE_LABELS = {
     "990804832":  "Negocio ganado",
     "1077494083": "Seguimiento subcontratación",
     "996161568":  "Negocio perdido",
-    "974964831":  "Nuevo",
-    "974964832":  "Empresa cualificada",
-    "974964833":  "Contacto clave identificado",
-    "974964834":  "Contactado sin feedback",
-    "991276872":  "Contactado sin interés",
+    # Etapas nuevas del pipeline LEAD (octubre 2026)
+    "1452888180": "BBDD",
+    "1452887693": "Selección",
+    "1452880567": "Reunión",
+    # Etapas antiguas del pipeline LEAD (ya vacías; se mantienen para el historial)
+    "974964831":  "Nuevo (antigua)",
+    "974964832":  "Empresa cualificada (antigua)",
+    "974964833":  "Contacto clave identificado (antigua)",
+    "974964834":  "Contactado sin feedback (antigua)",
+    "991276872":  "Contactado sin interés (antigua)",
+    "1185458868": "Seguimiento Onura (antigua)",
+    "1185458869": "Seguimiento Rafa (antigua)",
+    "974964836":  "Reunión realizada (antigua)",
+    # Etapas que siguen en uso
     "974964835":  "Interesado — sin reunión",
     "1077424678": "Seguimiento subcontratación (lead)",
-    "1185458868": "Seguimiento Onura",
-    "1185458869": "Seguimiento Rafa",
-    "974964836":  "Reunión realizada",
     "974964837":  "Facturas recibidas (lead)",
     "975190032":  "Petición más info (lead)",
     "975190033":  "Solicitud presupuesto proveedor (lead)",
@@ -85,12 +91,46 @@ STAGE_LABELS = {
     "990996103":  "Informe presentado (lead)",
     "991037466":  "Cierre ganado",
     "991037467":  "Cierre perdido",
-    "1397904426": "Descartado subcontratación (lead)",
+    "1397904426": "Descartado",
 }
 
 WON_STAGES  = {"990804832", "991037466"}
 LOST_STAGES = {"996161568", "991037467"}
 STALE_DAYS  = [14, 30, 60]
+
+# ─────────────────────────────────────────────
+# NUEVA ESTRUCTURA LEAD — CUPO SEMANAL
+# ─────────────────────────────────────────────
+LEAD_PIPELINE_ID = "664092197"
+ST_BBDD        = "1452888180"
+ST_SELECCION   = "1452887693"
+ST_REUNION     = "1452880567"
+ST_DESCARTADO  = "1397904426"
+ST_PRESUPUESTO = "975190033"   # Solicitud presupuesto proveedor (lead)
+ST_GANADO_LEAD = "991037466"   # Cierre ganado
+
+# Etapas de análisis (después de la reunión y antes del cierre)
+ANALISIS_STAGES = {"974964837", "975190032", "975190033", "975190034", "990996102", "990996103"}
+
+# Fecha en la que se reorganizó el pipeline LEAD: ese día se movieron
+# negocios en bloque a BBDD, Reunión y Descartado. Esas entradas NO cuentan
+# como reuniones ni descartes reales en los KPIs.
+MIGRACION_DIA = "2026-10-06"
+
+# Valores por defecto (se pueden cambiar en la barra lateral)
+CUPO_POR_DEFECTO      = 20
+SEMANAS_CADUCIDAD_DEF = 3
+
+# Fecha de entrada en cada etapa que se descarga de HubSpot
+# (clave = id de etapa, valor = nombre de la columna en la app)
+TRACKED_STAGE_DATES = {
+    ST_BBDD:        "f_bbdd",
+    ST_SELECCION:   "f_seleccion",
+    ST_REUNION:     "f_reunion",
+    ST_DESCARTADO:  "f_descartado",
+    ST_PRESUPUESTO: "f_presupuesto",
+    ST_GANADO_LEAD: "f_ganado",
+}
 
 # Zona horaria de España — todas las fechas del dashboard se muestran en hora peninsular
 TZ_ESPANA = "Europe/Madrid"
@@ -127,7 +167,12 @@ def get_all_deals(api_key):
         "dealname", "dealstage", "pipeline", "hubspot_owner_id",
         "amount", "createdate", "closedate",
         "hs_lastmodifieddate", "hs_last_activity_date", "notes_last_updated",
+        "hs_v2_date_entered_current_stage",
     ]
+    # Fecha de entrada en las etapas clave (versión nueva y antigua de HubSpot)
+    for _sid in TRACKED_STAGE_DATES:
+        props.append(f"hs_v2_date_entered_{_sid}")
+        props.append(f"hs_date_entered_{_sid}")
     all_deals = []
     params = {"limit": 100, "properties": ",".join(props)}
     while True:
@@ -426,7 +471,13 @@ def parse_deals(raw_deals):
         p = d.get("properties", {})
         owner_id    = str(p.get("hubspot_owner_id") or "")
         pipeline_id = str(p.get("pipeline") or "")
+        stage_dates = {
+            col: parse_dt(p.get(f"hs_v2_date_entered_{sid}") or p.get(f"hs_date_entered_{sid}"))
+            for sid, col in TRACKED_STAGE_DATES.items()
+        }
         rows.append({
+            **stage_dates,
+            "f_etapa_actual":     parse_dt(p.get("hs_v2_date_entered_current_stage")),
             "deal_id":            d["id"],
             "dealname":           p.get("dealname", ""),
             "dealstage":          p.get("dealstage", ""),
@@ -441,7 +492,12 @@ def parse_deals(raw_deals):
             "last_activity_date": parse_dt(p.get("hs_last_activity_date")),
             "notes_last_updated": parse_dt(p.get("notes_last_updated")),
         })
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # Si una columna de fecha viene vacía en todos los negocios, asegurar tipo fecha
+    for col in list(TRACKED_STAGE_DATES.values()) + ["f_etapa_actual"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
 
 def activity_by_owner(df, week_start, week_end):
     """
@@ -553,7 +609,8 @@ CLOSED_STAGES = WON_STAGES | LOST_STAGES | {
     "991037467",  # Cierre perdido
     "990804832",  # Negocio ganado
     "996161568",  # Negocio perdido
-    "991276872",  # Contactado sin interés (ambos pipelines)
+    "991276872",  # Contactado sin interés (antigua)
+    "1397904426", # Descartado
 }
 
 def stale_deals(df, thresholds, reference_date):
@@ -569,6 +626,133 @@ def stale_deals(df, thresholds, reference_date):
     return results
 
 # ─────────────────────────────────────────────
+# CUPO SEMANAL Y EMBUDO (pipeline LEAD)
+# ─────────────────────────────────────────────
+
+def _en_periodo(serie, inicio, fin, excluir_migracion=False):
+    """True si la fecha está dentro del período (opcionalmente sin el día de la migración)."""
+    mask = serie.notna() & (serie >= inicio) & (serie <= fin)
+    if excluir_migracion:
+        mask &= serie.dt.strftime("%Y-%m-%d") != MIGRACION_DIA
+    return mask
+
+def cupo_semanal(df_lead, inicio, fin, hoy, cupo, semanas_caducidad):
+    """
+    Calcula el cupo de cada comercial en el pipeline LEAD.
+
+    - En Selección: negocios que están ahora en la etapa Selección (ocupan hueco).
+    - Nuevos: de los anteriores, los que entraron en Selección dentro del período.
+    - Arrastrados: los que entraron en Selección antes del período.
+    - Reuniones: negocios que entraron en Reunión dentro del período.
+    - Descartados: negocios que entraron en Descartado dentro del período.
+    - Huecos libres: cupo − negocios en Selección.
+    Devuelve (resumen_por_comercial, negocios_en_seleccion).
+    """
+    df = df_lead.copy()
+    en_sel = df[df["dealstage"] == ST_SELECCION].copy()
+    fecha_sel = en_sel["f_seleccion"].fillna(en_sel["f_etapa_actual"])
+    en_sel["fecha_seleccion"] = fecha_sel
+    en_sel["semanas_en_seleccion"] = ((hoy - fecha_sel).dt.days // 7).fillna(0).astype(int)
+    en_sel["es_nuevo"] = fecha_sel.notna() & (fecha_sel >= inicio) & (fecha_sel <= fin)
+
+    def _estado(semanas):
+        if semanas >= semanas_caducidad:
+            return "🔴 Caducado"
+        if semanas >= semanas_caducidad - 1:
+            return "🟡 A punto de caducar"
+        return "🟢 En plazo"
+    en_sel["estado"] = en_sel["semanas_en_seleccion"].apply(_estado)
+
+    reuniones   = df[_en_periodo(df["f_reunion"],    inicio, fin, excluir_migracion=True)]
+    descartados = df[_en_periodo(df["f_descartado"], inicio, fin, excluir_migracion=True)]
+
+    owners = sorted(set(en_sel["owner"]) | set(reuniones["owner"]) | set(descartados["owner"]))
+    filas = []
+    for o in owners:
+        sel_o = en_sel[en_sel["owner"] == o]
+        n_sel = len(sel_o)
+        filas.append({
+            "owner":        o,
+            "en_seleccion": n_sel,
+            "nuevos":       int(sel_o["es_nuevo"].sum()),
+            "arrastrados":  int((~sel_o["es_nuevo"]).sum()),
+            "reuniones":    int((reuniones["owner"] == o).sum()),
+            "descartados":  int((descartados["owner"] == o).sum()),
+            "caducados":    int((sel_o["estado"] == "🔴 Caducado").sum()),
+            "huecos_libres": max(cupo - n_sel, 0),
+            "exceso":        max(n_sel - cupo, 0),
+        })
+    cols = ["owner", "en_seleccion", "nuevos", "arrastrados", "reuniones",
+            "descartados", "caducados", "huecos_libres", "exceso"]
+    resumen = pd.DataFrame(filas, columns=cols)
+    if not resumen.empty:
+        resumen = resumen.sort_values(["reuniones", "en_seleccion"], ascending=False)
+    return resumen, en_sel, reuniones, descartados
+
+def embudo_lead(df_lead):
+    """Número de negocios que hay ahora mismo en cada paso del embudo LEAD."""
+    pasos = [
+        ("BBDD",        df_lead["dealstage"] == ST_BBDD),
+        ("Selección",   df_lead["dealstage"] == ST_SELECCION),
+        ("Reunión",     df_lead["dealstage"] == ST_REUNION),
+        ("En análisis", df_lead["dealstage"].isin(ANALISIS_STAGES)),
+        ("Cliente",     df_lead["dealstage"] == ST_GANADO_LEAD),
+    ]
+    return pd.DataFrame([{"paso": n, "negocios": int(m.sum())} for n, m in pasos])
+
+def kpis_evolucion(df_lead, frecuencia, n_periodos, hoy):
+    """
+    Cuenta, por semana o por mes, cuántos negocios entraron en
+    Selección, Reunión, Solicitud de presupuesto y Cierre ganado.
+    No cuenta los movimientos en bloque del día de la migración.
+    """
+    if frecuencia == "Semana":
+        fin_ult = pd.Timestamp(hoy).normalize() - pd.Timedelta(days=pd.Timestamp(hoy).weekday())
+        inicios = [fin_ult - pd.Timedelta(weeks=i) for i in range(n_periodos - 1, -1, -1)]
+        etiquetas = [f"Sem. {d.strftime('%d/%m')}" for d in inicios]
+        fines = [d + pd.Timedelta(days=7) - pd.Timedelta(microseconds=1) for d in inicios]
+    else:
+        primero = pd.Timestamp(hoy).normalize().replace(day=1)
+        inicios = [primero - pd.DateOffset(months=i) for i in range(n_periodos - 1, -1, -1)]
+        MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+        etiquetas = [f"{MESES[d.month - 1]} {d.strftime('%y')}" for d in inicios]
+        fines = [d + pd.DateOffset(months=1) - pd.Timedelta(microseconds=1) for d in inicios]
+
+    metricas = [
+        ("Seleccionados", "f_seleccion"),
+        ("Reuniones",     "f_reunion"),
+        ("Presupuestos",  "f_presupuesto"),
+        ("Clientes",      "f_ganado"),
+    ]
+    filas = []
+    for etiqueta, ini, fin in zip(etiquetas, inicios, fines):
+        fila = {"periodo": etiqueta}
+        for nombre, col in metricas:
+            excluir = nombre != "Seleccionados"
+            fila[nombre] = int(_en_periodo(df_lead[col], ini, fin, excluir_migracion=excluir).sum())
+        filas.append(fila)
+    return pd.DataFrame(filas)
+
+def kpis_por_comercial(df_lead, inicio, fin):
+    """Seleccionados, reuniones, presupuestos y clientes de cada comercial en el período."""
+    metricas = {
+        "Seleccionados": ("f_seleccion", False),
+        "Reuniones":     ("f_reunion", True),
+        "Presupuestos":  ("f_presupuesto", True),
+        "Clientes":      ("f_ganado", True),
+    }
+    res = pd.DataFrame({"Comercial": sorted(df_lead["owner"].unique())})
+    for nombre, (col, excl) in metricas.items():
+        sub = df_lead[_en_periodo(df_lead[col], inicio, fin, excluir_migracion=excl)]
+        cuenta = sub.groupby("owner").size()
+        res[nombre] = res["Comercial"].map(cuenta).fillna(0).astype(int)
+    res["% Reunión / Selección"] = (
+        (res["Reuniones"] / res["Seleccionados"] * 100).where(res["Seleccionados"] > 0, 0).round(0).astype(int)
+    )
+    res = res[res[list(metricas)].sum(axis=1) > 0]
+    return res.sort_values("Reuniones", ascending=False)
+
+# ─────────────────────────────────────────────
 # PERSISTENCIA DE SNAPSHOTS
 # ─────────────────────────────────────────────
 
@@ -582,6 +766,10 @@ def _snapshots_to_json(snapshots: dict) -> str:
         # Marcar las fechas con la zona horaria española antes de guardar,
         # para que al recargar el snapshot las horas no se desplacen.
         df_save = snap["df_week"].copy()
+        # Las fechas de entrada en etapas no hacen falta en los snapshots
+        _extra = [c for c in list(TRACKED_STAGE_DATES.values()) + ["f_etapa_actual"] if c in df_save.columns]
+        if _extra:
+            df_save = df_save.drop(columns=_extra)
         for col in date_cols:
             if col in df_save.columns and pd.api.types.is_datetime64_any_dtype(df_save[col]):
                 try:
@@ -1253,6 +1441,23 @@ owner_filter = st.sidebar.multiselect(
     "Filtrar comercial", options=sorted(OWNER_NAMES.values()),
     default=[], placeholder="Todos",
 )
+incluir_bbdd = st.sidebar.checkbox(
+    "Incluir BBDD en actividad y estancados", value=False,
+    help="La etapa BBDD es la reserva de empresas sin trabajar. Por defecto no cuenta "
+         "como negocio abierto para que no distorsione la tasa de actividad ni los estancados.",
+)
+
+st.sidebar.divider()
+st.sidebar.subheader("🎯 Cupo semanal (LEAD)")
+cupo_comercial = st.sidebar.number_input(
+    "Cupo por comercial", min_value=1, max_value=200, value=CUPO_POR_DEFECTO, step=1,
+    help="Número máximo de negocios en Selección que trabaja cada comercial a la vez.",
+)
+semanas_caducidad = st.sidebar.number_input(
+    "Semanas en Selección para caducar", min_value=1, max_value=12,
+    value=SEMANAS_CADUCIDAD_DEF, step=1,
+    help="A partir de estas semanas en Selección sin conseguir reunión, el negocio se marca como caducado.",
+)
 
 st.sidebar.divider()
 st.sidebar.subheader("📸 Snapshots semanales")
@@ -1347,9 +1552,16 @@ if pipeline_filter:
 if owner_filter:
     df_all = df_all[df_all["owner"].isin(owner_filter)]
 
+# Todos los negocios del pipeline LEAD (abiertos y cerrados) — para Cupo y Embudo
+df_lead = df_all[df_all["pipeline_id"] == LEAD_PIPELINE_ID].copy()
+
 # A partir de aquí todo el dashboard trabaja SOLO con negocios abiertos
 df_closed = df_all[df_all["dealstage"].isin(CLOSED_STAGES)].copy()  # guardamos cerrados solo para cierres KPI
 df_all    = df_all[~df_all["dealstage"].isin(CLOSED_STAGES)].copy()
+n_bbdd    = int((df_all["dealstage"] == ST_BBDD).sum())
+if not incluir_bbdd:
+    # BBDD = reserva de empresas sin trabajar → fuera de actividad y estancados
+    df_all = df_all[df_all["dealstage"] != ST_BBDD].copy()
 
 # df_week basado en notes_last_updated — misma propiedad que usa HubSpot UI
 df_week = df_all[
@@ -1435,7 +1647,8 @@ stale_data = stale_deals(df_all, STALE_DAYS, today)
 # ── CABECERA ───────────────────────────────────
 
 st.title("📊 Pipeline Tracker — HubSpot")
-st.caption(f"Período: **{week_label}** · {len(df_all):,} negocios abiertos · Actualizado: {today.strftime('%d/%m/%Y %H:%M')}")
+_bbdd_txt = "" if incluir_bbdd else f" (sin contar {n_bbdd:,} en BBDD)"
+st.caption(f"Período: **{week_label}** · {len(df_all):,} negocios abiertos{_bbdd_txt} · Actualizado: {today.strftime('%d/%m/%Y %H:%M')}")
 
 # ── KPIs ───────────────────────────────────────
 
@@ -1515,6 +1728,8 @@ st.divider()
 # ── PESTAÑAS ───────────────────────────────────
 
 tabs = st.tabs([
+    "🎯 Cupo semanal",
+    "📈 Embudo y KPIs",
     "👤 Comerciales",
     "📋 Etapas",
     "🔄 Cambios de etapa",
@@ -1524,9 +1739,233 @@ tabs = st.tabs([
     "📊 Comparativa semanal",
 ])
 
-# ── TAB 1: COMERCIALES ─────────────────────────
+# ── TAB 0: CUPO SEMANAL ────────────────────────
+
+COLOR_REUNION    = "#1D9E75"
+COLOR_DESCARTADO = "#D85A30"
+COLOR_ARRASTRADO = "#B4B2A9"
+COLOR_NUEVO      = "#185FA5"
 
 with tabs[0]:
+    st.subheader("🎯 Cupo semanal — pipeline LEAD")
+    st.caption(
+        f"Cada comercial trabaja como máximo **{cupo_comercial}** negocios a la vez en la etapa **Selección**. "
+        f"Cada lunes solo se le asignan negocios nuevos para rellenar los huecos libres. "
+        f"Reuniones y descartados se cuentan dentro del período elegido en la barra lateral ({week_label})."
+    )
+
+    if df_lead.empty:
+        st.info("No hay negocios del pipeline LEAD con los filtros actuales. Revisa el filtro de pipeline en la barra lateral.")
+    else:
+        cupo_df, sel_df, reun_df, desc_df = cupo_semanal(
+            df_lead, week_start, week_end, today, cupo_comercial, semanas_caducidad
+        )
+
+        if cupo_df.empty:
+            st.info("Todavía no hay negocios en Selección ni reuniones en el período. "
+                    "Cuando los comerciales pasen negocios de BBDD a Selección aparecerán aquí.")
+        else:
+            total_sel   = int(cupo_df["en_seleccion"].sum())
+            total_arr   = int(cupo_df["arrastrados"].sum())
+            total_nue   = int(cupo_df["nuevos"].sum())
+            total_reu   = int(cupo_df["reuniones"].sum())
+            total_desc  = int(cupo_df["descartados"].sum())
+            total_lib   = int(cupo_df["huecos_libres"].sum())
+            total_cad   = int(cupo_df["caducados"].sum())
+
+            m = st.columns(6)
+            m[0].metric("Reuniones conseguidas", f"{total_reu:,}", help="Negocios que entraron en la etapa Reunión dentro del período.")
+            m[1].metric("Descartados", f"{total_desc:,}", help="Negocios que pasaron a Descartado dentro del período.")
+            m[2].metric("Nuevos en Selección", f"{total_nue:,}", help="Negocios que entraron en Selección dentro del período.")
+            m[3].metric("Arrastrados", f"{total_arr:,}", help="Negocios en Selección desde antes del período (siguen ocupando hueco).")
+            m[4].metric("Caducados", f"{total_cad:,}", help=f"Negocios con {semanas_caducidad} semanas o más en Selección.")
+            m[5].metric("Huecos libres hoy", f"{total_lib:,}", help="Negocios nuevos que se pueden asignar ahora (cupo − en Selección).")
+            st.caption(f"Total en Selección ahora: **{total_sel}** negocios.")
+
+            st.markdown("##### Cupo por comercial")
+            fig = go.Figure()
+            for nombre, col, color in [
+                ("Reuniones",   "reuniones",   COLOR_REUNION),
+                ("Descartados", "descartados", COLOR_DESCARTADO),
+                ("Arrastrados", "arrastrados", COLOR_ARRASTRADO),
+                ("Nuevos",      "nuevos",      COLOR_NUEVO),
+            ]:
+                fig.add_bar(
+                    name=nombre, y=cupo_df["owner"], x=cupo_df[col], orientation="h",
+                    marker_color=color, marker_line_width=0,
+                    text=cupo_df[col].where(cupo_df[col] > 0, None), textposition="inside",
+                )
+            fig.add_bar(
+                name="Huecos libres", y=cupo_df["owner"], x=cupo_df["huecos_libres"], orientation="h",
+                marker_color="rgba(0,0,0,0)", marker_line_color="#B4B2A9", marker_line_width=1,
+                text=[f"{v} libres" if v else "" for v in cupo_df["huecos_libres"]],
+                textposition="inside", textfont_color="#185FA5",
+            )
+            fig.update_layout(
+                barmode="stack", height=max(260, 60 + 48 * len(cupo_df)),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                margin=dict(l=10, r=10, t=30, b=10),
+                **PLOT_LAYOUT,
+            )
+            fig.update_yaxes(autorange="reversed")
+            fig.update_xaxes(title_text="Negocios")
+            st.plotly_chart(fig, use_container_width=True)
+
+            exceso = cupo_df[cupo_df["exceso"] > 0]
+            for _, r in exceso.iterrows():
+                st.warning(f"**{r['owner']}** tiene {r['en_seleccion']} negocios en Selección: "
+                           f"{r['exceso']} por encima del cupo de {cupo_comercial}.")
+
+            st.dataframe(
+                cupo_df.rename(columns={
+                    "owner": "Comercial", "en_seleccion": "En Selección", "nuevos": "Nuevos",
+                    "arrastrados": "Arrastrados", "reuniones": "Reuniones", "descartados": "Descartados",
+                    "caducados": "Caducados", "huecos_libres": "Huecos libres", "exceso": "Por encima del cupo",
+                }),
+                hide_index=True, use_container_width=True,
+            )
+
+            # Negocios a punto de caducar
+            st.markdown("##### ⏳ A punto de caducar y caducados")
+            st.caption(
+                f"Negocios que llevan {semanas_caducidad - 1} o más semanas en Selección sin conseguir reunión. "
+                f"Los caducados (≥ {semanas_caducidad} semanas) deberían pasar a Descartado o volver a BBDD para liberar el hueco."
+            )
+            riesgo = sel_df[sel_df["estado"] != "🟢 En plazo"].sort_values("semanas_en_seleccion", ascending=False)
+            if riesgo.empty:
+                st.success("✅ Ningún negocio está a punto de caducar.")
+            else:
+                st.dataframe(
+                    pd.DataFrame({
+                        "Negocio":              riesgo["dealname"],
+                        "Comercial":            riesgo["owner"],
+                        "Estado":               riesgo["estado"],
+                        "Semanas en Selección": riesgo["semanas_en_seleccion"],
+                        "En Selección desde":   riesgo["fecha_seleccion"].dt.strftime("%d/%m/%Y").fillna("—"),
+                        "Última actividad":     riesgo["notes_last_updated"].dt.strftime("%d/%m/%Y").fillna("—"),
+                    }),
+                    hide_index=True, use_container_width=True,
+                    height=min(450, 55 + len(riesgo) * 35),
+                )
+
+            # Detalle por comercial
+            st.markdown("##### Detalle por comercial")
+            for _, r in cupo_df.iterrows():
+                o = r["owner"]
+                with st.expander(
+                    f"👤 **{o}** — {r['en_seleccion']} en Selección · {r['reuniones']} reuniones · "
+                    f"{r['huecos_libres']} huecos libres"
+                ):
+                    t1, t2, t3 = st.tabs(["📋 En Selección", "✅ Reuniones del período", "❌ Descartados del período"])
+                    with t1:
+                        so = sel_df[sel_df["owner"] == o].sort_values("semanas_en_seleccion", ascending=False)
+                        if so.empty:
+                            st.info("No tiene negocios en Selección.")
+                        else:
+                            st.dataframe(pd.DataFrame({
+                                "Negocio":              so["dealname"],
+                                "Tipo":                 so["es_nuevo"].map({True: "Nuevo", False: "Arrastrado"}),
+                                "Estado":               so["estado"],
+                                "Semanas en Selección": so["semanas_en_seleccion"],
+                                "En Selección desde":   so["fecha_seleccion"].dt.strftime("%d/%m/%Y").fillna("—"),
+                                "Última actividad":     so["notes_last_updated"].dt.strftime("%d/%m/%Y").fillna("—"),
+                            }), hide_index=True, use_container_width=True)
+                    with t2:
+                        ro = reun_df[reun_df["owner"] == o]
+                        if ro.empty:
+                            st.info("Sin reuniones en el período.")
+                        else:
+                            st.dataframe(pd.DataFrame({
+                                "Negocio":       ro["dealname"],
+                                "Fecha reunión": ro["f_reunion"].dt.strftime("%d/%m/%Y").fillna("—"),
+                                "Etapa actual":  ro["dealstage"].map(STAGE_LABELS).fillna(ro["dealstage"]),
+                            }), hide_index=True, use_container_width=True)
+                    with t3:
+                        do = desc_df[desc_df["owner"] == o]
+                        if do.empty:
+                            st.info("Sin descartados en el período.")
+                        else:
+                            st.dataframe(pd.DataFrame({
+                                "Negocio":          do["dealname"],
+                                "Fecha descartado": do["f_descartado"].dt.strftime("%d/%m/%Y").fillna("—"),
+                            }), hide_index=True, use_container_width=True)
+
+# ── TAB 0b: EMBUDO Y KPIs ──────────────────────
+
+with tabs[1]:
+    st.subheader("📈 Embudo LEAD y evolución")
+
+    if df_lead.empty:
+        st.info("No hay negocios del pipeline LEAD con los filtros actuales.")
+    else:
+        emb = embudo_lead(df_lead)
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            st.markdown("##### Situación actual del embudo")
+            fig = go.Figure(go.Funnel(
+                y=emb["paso"], x=emb["negocios"],
+                textinfo="value",
+                marker=dict(color=["#B5D4F4", "#185FA5", "#1D9E75", "#F4A835", "#0C447C"]),
+                connector=dict(line=dict(color="#E8EAF0", width=1)),
+            ))
+            fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), **PLOT_LAYOUT)
+            st.plotly_chart(fig, use_container_width=True)
+        with c2:
+            st.markdown("##### Qué significa cada paso")
+            st.markdown(
+                "- **BBDD**: empresas en reserva, todavía sin trabajar.\n"
+                "- **Selección**: elegidas para conseguir visita (el cupo).\n"
+                "- **Reunión**: visita conseguida.\n"
+                "- **En análisis**: facturas, ofertas e informe de ahorro.\n"
+                "- **Cliente**: cierre ganado."
+            )
+            otros = df_lead[df_lead["dealstage"].isin({"974964835", "1077424678"})]
+            if not otros.empty:
+                st.caption(
+                    f"Fuera del embudo: {int((otros['dealstage'] == '974964835').sum())} en *Interesado — sin reunión* "
+                    f"y {int((otros['dealstage'] == '1077424678').sum())} en *Seguimiento subcontratación*."
+                )
+
+        st.divider()
+        st.markdown("##### Evolución")
+        e1, e2 = st.columns([1, 2])
+        with e1:
+            frecuencia = st.radio("Agrupar por", ["Semana", "Mes"], horizontal=True, key="kpi_freq")
+        with e2:
+            n_per = st.slider(
+                "Número de períodos", min_value=4, max_value=26 if frecuencia == "Semana" else 12,
+                value=12 if frecuencia == "Semana" else 6, key="kpi_n",
+            )
+        evo = kpis_evolucion(df_lead, frecuencia, n_per, today)
+        fig = go.Figure()
+        for nombre, color in [("Seleccionados", "#B5D4F4"), ("Reuniones", "#1D9E75"),
+                              ("Presupuestos", "#F4A835"), ("Clientes", "#0C447C")]:
+            fig.add_bar(name=nombre, x=evo["periodo"], y=evo[nombre], marker_color=color,
+                        marker_line_width=0, text=evo[nombre].where(evo[nombre] > 0, None),
+                        textposition="outside")
+        fig.update_layout(barmode="group", height=380,
+                          legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                          margin=dict(l=10, r=10, t=30, b=10), **PLOT_LAYOUT)
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            "Seleccionados = entradas en Selección · Reuniones = entradas en Reunión · "
+            "Presupuestos = entradas en *Solicitud presupuesto proveedor* · Clientes = entradas en *Cierre ganado*. "
+            f"No se cuentan los movimientos en bloque de la reorganización del {pd.Timestamp(MIGRACION_DIA).strftime('%d/%m/%Y')}."
+        )
+        with st.expander("Ver tabla"):
+            st.dataframe(evo.rename(columns={"periodo": "Período"}), hide_index=True, use_container_width=True)
+
+        st.divider()
+        st.markdown(f"##### Por comercial — {week_label}")
+        kpc = kpis_por_comercial(df_lead, week_start, week_end)
+        if kpc.empty:
+            st.info("Sin movimientos en el período seleccionado.")
+        else:
+            st.dataframe(kpc, hide_index=True, use_container_width=True)
+
+# ── TAB 1: COMERCIALES ─────────────────────────
+
+with tabs[2]:
     st.subheader("Actividad semanal por comercial")
 
     # Tarjetas semáforo
@@ -1650,7 +2089,7 @@ with tabs[0]:
 
 # ── TAB 2: ETAPAS ──────────────────────────────
 
-with tabs[1]:
+with tabs[3]:
     st.subheader("Actividad por etapa esta semana")
     top = stage_df[stage_df["active_this_week"] > 0].head(20)
     if top.empty:
@@ -1690,7 +2129,7 @@ with tabs[1]:
 
 # ── TAB 3: CAMBIOS DE ETAPA ────────────────────
 
-with tabs[2]:
+with tabs[4]:
     st.subheader("Cambios de etapa esta semana")
     if trans_df.empty:
         st.info("No se detectaron cambios de etapa. Activa 'Cargar historial de etapas' en la barra lateral.")
@@ -1773,7 +2212,7 @@ with tabs[2]:
 
 # ── TAB 4: NUEVOS NEGOCIOS ─────────────────────
 
-with tabs[3]:
+with tabs[5]:
     st.subheader("Negocios creados esta semana")
     if new_df.empty:
         st.info("No se crearon negocios nuevos en el período seleccionado.")
@@ -1798,7 +2237,7 @@ with tabs[3]:
 
 # ── TAB 5: ESTANCADOS ──────────────────────────
 
-with tabs[4]:
+with tabs[6]:
     st.subheader("⚠️ Negocios sin actividad")
     st.caption("Negocios abiertos (no ganados ni perdidos) sin actividad real desde hace X días.")
 
@@ -1850,7 +2289,7 @@ with tabs[4]:
 
 # ── TAB 6: MAPA DE CALOR ───────────────────────
 
-with tabs[5]:
+with tabs[7]:
     st.subheader("🌡️ Mapa de calor — Comercial × Etapa")
     st.caption("Intensidad = número de negocios. Detecta dónde se acumulan y posibles cuellos de botella.")
 
@@ -1897,7 +2336,7 @@ with tabs[5]:
 
 # ── TAB 7: COMPARATIVA ────────────────────────
 
-with tabs[6]:
+with tabs[8]:
     st.subheader("📊 Comparativa entre semanas")
     st.caption("Guarda snapshots de distintas semanas desde la barra lateral y compáralas aquí.")
 
