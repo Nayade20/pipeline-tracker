@@ -268,6 +268,51 @@ def get_real_activity(api_key, since_ts_ms, until_ts_ms):
 
     return deal_activity
 
+def get_meetings(api_key, since_ts_ms, until_ts_ms):
+    """
+    Reuniones registradas en HubSpot (actividad tipo reunión) entre dos fechas.
+    Se usa la búsqueda por fecha: el número de reuniones es pequeño, así que
+    no hay riesgo de que HubSpot corte resultados (como sí pasaba con emails).
+    No cuenta las reuniones marcadas como canceladas o "no presentado".
+    """
+    url = f"{BASE_URL}/crm/v3/objects/meetings/search"
+    filas, after = [], None
+    while True:
+        payload = {
+            "filterGroups": [{"filters": [{
+                "propertyName": "hs_timestamp", "operator": "BETWEEN",
+                "value": str(since_ts_ms), "highValue": str(until_ts_ms),
+            }]}],
+            "properties": ["hs_timestamp", "hubspot_owner_id", "hs_meeting_title", "hs_meeting_outcome"],
+            "limit": 100,
+        }
+        if after:
+            payload["after"] = after
+        try:
+            data = hs_post(api_key, url, payload)
+        except Exception as e:
+            st.session_state["_meetings_error"] = str(e)
+            break
+        for item in data.get("results", []):
+            p = item.get("properties", {})
+            outcome = (p.get("hs_meeting_outcome") or "").upper()
+            if outcome in {"CANCELED", "CANCELLED", "NO_SHOW"}:
+                continue
+            filas.append({
+                "meeting_id": item["id"],
+                "fecha":      parse_dt(p.get("hs_timestamp")),
+                "owner_id":   str(p.get("hubspot_owner_id") or ""),
+                "titulo":     p.get("hs_meeting_title") or "Reunión",
+            })
+        after = data.get("paging", {}).get("next", {}).get("after")
+        if not after or len(filas) >= 9900:
+            break
+        time.sleep(0.15)
+    df = pd.DataFrame(filas, columns=["meeting_id", "fecha", "owner_id", "titulo"])
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    df["owner"] = df["owner_id"].map(OWNER_NAMES).fillna("Owner " + df["owner_id"])
+    return df
+
 def get_stage_history_bulk(api_key, deal_ids):
     results = {}
     for i in range(0, len(deal_ids), 10):
@@ -700,57 +745,207 @@ def embudo_lead(df_lead):
     ]
     return pd.DataFrame([{"paso": n, "negocios": int(m.sum())} for n, m in pasos])
 
-def kpis_evolucion(df_lead, frecuencia, n_periodos, hoy):
-    """
-    Cuenta, por semana o por mes, cuántos negocios entraron en
-    Selección, Reunión, Solicitud de presupuesto y Cierre ganado.
-    No cuenta los movimientos en bloque del día de la migración.
-    """
-    if frecuencia == "Semana":
-        fin_ult = pd.Timestamp(hoy).normalize() - pd.Timedelta(days=pd.Timestamp(hoy).weekday())
-        inicios = [fin_ult - pd.Timedelta(weeks=i) for i in range(n_periodos - 1, -1, -1)]
-        etiquetas = [f"Sem. {d.strftime('%d/%m')}" for d in inicios]
-        fines = [d + pd.Timedelta(days=7) - pd.Timedelta(microseconds=1) for d in inicios]
-    else:
-        primero = pd.Timestamp(hoy).normalize().replace(day=1)
-        inicios = [primero - pd.DateOffset(months=i) for i in range(n_periodos - 1, -1, -1)]
-        MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
-        etiquetas = [f"{MESES[d.month - 1]} {d.strftime('%y')}" for d in inicios]
-        fines = [d + pd.DateOffset(months=1) - pd.Timedelta(microseconds=1) for d in inicios]
+MESES_ES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+KPI_ORDEN = ["Seleccionados", "Visitas", "Reuniones", "Presupuestos", "Clientes"]
+KPI_DESCRIPCION = {
+    "Seleccionados": "Negocios que entran en la etapa Selección (pasan al cupo)",
+    "Visitas":       "Negocios que entran en la etapa Reunión del pipeline LEAD",
+    "Reuniones":     "Reuniones registradas como actividad en HubSpot (sin canceladas)",
+    "Presupuestos":  "Negocios que entran en Solicitud presupuesto proveedor (LEAD)",
+    "Clientes":      "Negocios que entran en Cierre ganado (LEAD)",
+}
 
-    metricas = [
-        ("Seleccionados", "f_seleccion"),
-        ("Reuniones",     "f_reunion"),
-        ("Presupuestos",  "f_presupuesto"),
-        ("Clientes",      "f_ganado"),
+def etiqueta_semana(fecha):
+    """'Sem 41' según el calendario (semana ISO, empieza en lunes)."""
+    iso = pd.Timestamp(fecha).isocalendar()
+    return f"Sem {iso.week:02d}"
+
+def estilo_degradado(tabla, rgb=(24, 95, 165), por_fila=True):
+    """Colorea las celdas de una tabla de números (más intenso = valor más alto) sin usar matplotlib."""
+    cols = [c for c in tabla.columns if c != "Total"]
+    def _colorear(bloque):
+        out = pd.DataFrame("", index=bloque.index, columns=bloque.columns)
+        for idx in bloque.index:
+            fila = bloque.loc[idx, cols]
+            maximo = fila.max() if por_fila else bloque[cols].values.max()
+            for c in cols:
+                v = fila[c]
+                if maximo and v > 0:
+                    a = 0.12 + 0.55 * (v / maximo)
+                    out.loc[idx, c] = f"background-color: rgba({rgb[0]},{rgb[1]},{rgb[2]},{a:.2f})"
+        if "Total" in bloque.columns:
+            out["Total"] = "font-weight: bold"
+        return out
+    return tabla.style.apply(_colorear, axis=None)
+
+def kpi_eventos(df_lead, meetings_df=None):
+    """
+    Lista de 'eventos' (una fila por cada visita, presupuesto, cliente...),
+    con su fecha, comercial y negocio. Todos los KPIs se calculan a partir de aquí.
+    No incluye los movimientos en bloque del día de la reorganización.
+    """
+    fuentes = [
+        ("Seleccionados", "f_seleccion",   False),
+        ("Visitas",       "f_reunion",     True),
+        ("Presupuestos",  "f_presupuesto", True),
+        ("Clientes",      "f_ganado",      True),
     ]
-    filas = []
-    for etiqueta, ini, fin in zip(etiquetas, inicios, fines):
-        fila = {"periodo": etiqueta}
-        for nombre, col in metricas:
-            excluir = nombre != "Seleccionados"
-            fila[nombre] = int(_en_periodo(df_lead[col], ini, fin, excluir_migracion=excluir).sum())
-        filas.append(fila)
-    return pd.DataFrame(filas)
+    partes = []
+    for kpi, col, excl in fuentes:
+        if col not in df_lead.columns:
+            continue
+        sub = df_lead[df_lead[col].notna()]
+        if excl:
+            sub = sub[sub[col].dt.strftime("%Y-%m-%d") != MIGRACION_DIA]
+        if sub.empty:
+            continue
+        partes.append(pd.DataFrame({
+            "fecha": sub[col].values, "kpi": kpi,
+            "owner": sub["owner"].values, "detalle": sub["dealname"].values,
+        }))
+    if meetings_df is not None and not meetings_df.empty:
+        m = meetings_df[meetings_df["fecha"].notna()]
+        partes.append(pd.DataFrame({
+            "fecha": m["fecha"].values, "kpi": "Reuniones",
+            "owner": m["owner"].values, "detalle": m["titulo"].values,
+        }))
+    if not partes:
+        return pd.DataFrame(columns=["fecha", "kpi", "owner", "detalle", "semana", "lunes", "mes", "mes_inicio"])
+    ev = pd.concat(partes, ignore_index=True)
+    ev["fecha"]      = pd.to_datetime(ev["fecha"])
+    ev["lunes"]      = (ev["fecha"] - pd.to_timedelta(ev["fecha"].dt.weekday, unit="D")).dt.normalize()
+    ev["semana"]     = ev["fecha"].apply(etiqueta_semana)
+    ev["mes_inicio"] = ev["fecha"].dt.to_period("M").dt.to_timestamp()
+    ev["mes"]        = ev["mes_inicio"].apply(lambda d: f"{MESES_ES[d.month - 1]} {d.year}")
+    return ev
 
-def kpis_por_comercial(df_lead, inicio, fin):
-    """Seleccionados, reuniones, presupuestos y clientes de cada comercial en el período."""
-    metricas = {
-        "Seleccionados": ("f_seleccion", False),
-        "Reuniones":     ("f_reunion", True),
-        "Presupuestos":  ("f_presupuesto", True),
-        "Clientes":      ("f_ganado", True),
-    }
-    res = pd.DataFrame({"Comercial": sorted(df_lead["owner"].unique())})
-    for nombre, (col, excl) in metricas.items():
-        sub = df_lead[_en_periodo(df_lead[col], inicio, fin, excluir_migracion=excl)]
+def periodos_kpi(frecuencia, n_periodos, hoy):
+    """Lista de (etiqueta, inicio, fin) de los últimos n períodos, del más antiguo al actual."""
+    hoy = pd.Timestamp(hoy)
+    out = []
+    if frecuencia == "Semana":
+        lunes = (hoy - pd.Timedelta(days=hoy.weekday())).normalize()
+        for i in range(n_periodos - 1, -1, -1):
+            ini = lunes - pd.Timedelta(weeks=i)
+            fin = ini + pd.Timedelta(days=7) - pd.Timedelta(microseconds=1)
+            out.append((f"{etiqueta_semana(ini)} · {ini.strftime('%d/%m')}", ini, fin))
+    else:
+        primero = hoy.normalize().replace(day=1)
+        for i in range(n_periodos - 1, -1, -1):
+            ini = primero - pd.DateOffset(months=i)
+            fin = ini + pd.DateOffset(months=1) - pd.Timedelta(microseconds=1)
+            out.append((f"{MESES_ES[ini.month - 1]} {ini.year}", ini, fin))
+    return out
+
+def tabla_kpis(eventos, periodos, kpis=KPI_ORDEN, owner=None):
+    """Tabla tipo cuadro de mando: una fila por KPI y una columna por período (+ Total)."""
+    ev = eventos if owner is None else eventos[eventos["owner"] == owner]
+    data = {}
+    for etiqueta, ini, fin in periodos:
+        sub = ev[(ev["fecha"] >= ini) & (ev["fecha"] <= fin)]
+        cuenta = sub.groupby("kpi").size()
+        data[etiqueta] = [int(cuenta.get(k, 0)) for k in kpis]
+    tabla = pd.DataFrame(data, index=kpis)
+    tabla["Total"] = tabla.sum(axis=1)
+    tabla.index.name = "KPI"
+    return tabla
+
+def tabla_comercial_periodo(eventos, periodos, kpi):
+    """Comerciales × períodos para un KPI concreto."""
+    filas = {}
+    owners = sorted(eventos["owner"].dropna().unique())
+    for etiqueta, ini, fin in periodos:
+        sub = eventos[(eventos["kpi"] == kpi) & (eventos["fecha"] >= ini) & (eventos["fecha"] <= fin)]
         cuenta = sub.groupby("owner").size()
-        res[nombre] = res["Comercial"].map(cuenta).fillna(0).astype(int)
-    res["% Reunión / Selección"] = (
-        (res["Reuniones"] / res["Seleccionados"] * 100).where(res["Seleccionados"] > 0, 0).round(0).astype(int)
-    )
-    res = res[res[list(metricas)].sum(axis=1) > 0]
-    return res.sort_values("Reuniones", ascending=False)
+        filas[etiqueta] = [int(cuenta.get(o, 0)) for o in owners]
+    tabla = pd.DataFrame(filas, index=owners)
+    tabla["Total"] = tabla.sum(axis=1)
+    tabla = tabla[tabla["Total"] > 0].sort_values("Total", ascending=False)
+    tabla.index.name = "Comercial"
+    return tabla
+
+def excel_kpis(eventos, periodos_sem, periodos_mes, titulo_rango):
+    """Excel con los KPIs: semanal, mensual, por comercial y detalle de cada evento."""
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    def _cabecera(ws, titulo, subtitulo, cols):
+        xl_header(ws, titulo, subtitulo, len(cols))
+        for ci, h in enumerate(cols, 1):
+            ws.cell(4, ci, h)
+        xl_style_headers(ws, 4, len(cols))
+        ws.freeze_panes = "B5"
+
+    def _hoja_tabla(nombre, titulo, tabla):
+        ws = wb.create_sheet(nombre)
+        cols = [tabla.index.name or ""] + list(tabla.columns)
+        _cabecera(ws, titulo, titulo_rango, cols)
+        r = 5
+        for idx, fila in tabla.iterrows():
+            ws.cell(row=r, column=1, value=str(idx))
+            for j, v in enumerate(fila.values, start=2):
+                ws.cell(row=r, column=j, value=int(v))
+            r += 1
+        xl_style_data(ws, 5, r - 1, len(cols))
+        for rr in range(5, r):
+            ws.cell(row=rr, column=len(cols)).font = Font(bold=True)
+        xl_auto_width(ws)
+        return ws
+
+    _hoja_tabla("KPIs semanales", "KPIs por semana — pipeline LEAD", tabla_kpis(eventos, periodos_sem))
+    _hoja_tabla("KPIs mensuales", "KPIs por mes — pipeline LEAD",   tabla_kpis(eventos, periodos_mes))
+
+    # Por comercial: una fila por comercial y semana
+    ws = wb.create_sheet("Por comercial")
+    cols = ["Comercial", "Semana"] + KPI_ORDEN
+    _cabecera(ws, "KPIs por comercial y semana", titulo_rango, cols)
+    r = 5
+    for owner in sorted(eventos["owner"].dropna().unique()):
+        for etiqueta, ini, fin in periodos_sem:
+            sub = eventos[(eventos["owner"] == owner) & (eventos["fecha"] >= ini) & (eventos["fecha"] <= fin)]
+            cuenta = sub.groupby("kpi").size()
+            valores = [int(cuenta.get(k, 0)) for k in KPI_ORDEN]
+            if sum(valores) == 0:
+                continue
+            ws.cell(row=r, column=1, value=owner)
+            ws.cell(row=r, column=2, value=etiqueta)
+            for j, v in enumerate(valores, start=3):
+                ws.cell(row=r, column=j, value=v)
+            r += 1
+    xl_style_data(ws, 5, max(r - 1, 5), len(cols))
+    xl_auto_width(ws)
+
+    # Detalle
+    ws = wb.create_sheet("Detalle")
+    cols = ["Fecha", "Semana", "Mes", "KPI", "Comercial", "Negocio / reunión"]
+    _cabecera(ws, "Detalle de cada evento", titulo_rango, cols)
+    ini_total = min(p[1] for p in periodos_sem + periodos_mes)
+    det = eventos[eventos["fecha"] >= ini_total].sort_values("fecha", ascending=False)
+    r = 5
+    for _, e in det.iterrows():
+        ws.cell(row=r, column=1, value=e["fecha"].strftime("%d/%m/%Y"))
+        ws.cell(row=r, column=2, value=e["semana"])
+        ws.cell(row=r, column=3, value=e["mes"])
+        ws.cell(row=r, column=4, value=e["kpi"])
+        ws.cell(row=r, column=5, value=e["owner"])
+        ws.cell(row=r, column=6, value=str(e["detalle"]))
+        r += 1
+    xl_style_data(ws, 5, max(r - 1, 5), len(cols))
+    xl_auto_width(ws, max_w=60)
+
+    # Definiciones
+    ws = wb.create_sheet("Definiciones")
+    _cabecera(ws, "Qué cuenta cada KPI", f"Semanas según calendario (lunes a domingo). No incluye los movimientos en bloque del {pd.Timestamp(MIGRACION_DIA).strftime('%d/%m/%Y')}.", ["KPI", "Qué cuenta"])
+    for i, k in enumerate(KPI_ORDEN, start=5):
+        ws.cell(row=i, column=1, value=k)
+        ws.cell(row=i, column=2, value=KPI_DESCRIPCION[k])
+    xl_style_data(ws, 5, 4 + len(KPI_ORDEN), 2)
+    xl_auto_width(ws, max_w=80)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
 
 # ─────────────────────────────────────────────
 # PERSISTENCIA DE SNAPSHOTS
@@ -1393,6 +1588,10 @@ def cached_real_activity(api_key, since_ts_ms, until_ts_ms):
     return get_real_activity(api_key, since_ts_ms, until_ts_ms)
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def cached_meetings(api_key, since_ts_ms, until_ts_ms):
+    return get_meetings(api_key, since_ts_ms, until_ts_ms)
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def cached_engagement_types(api_key, deal_ids_tuple, notes_ts_tuple=None):
     notes_map = dict(notes_ts_tuple) if notes_ts_tuple else None
     return get_engagement_types(api_key, list(deal_ids_tuple), notes_map)
@@ -1927,41 +2126,122 @@ with tabs[1]:
                 )
 
         st.divider()
-        st.markdown("##### Evolución")
-        e1, e2 = st.columns([1, 2])
-        with e1:
-            frecuencia = st.radio("Agrupar por", ["Semana", "Mes"], horizontal=True, key="kpi_freq")
-        with e2:
-            n_per = st.slider(
-                "Número de períodos", min_value=4, max_value=26 if frecuencia == "Semana" else 12,
-                value=12 if frecuencia == "Semana" else 6, key="kpi_n",
-            )
-        evo = kpis_evolucion(df_lead, frecuencia, n_per, today)
-        fig = go.Figure()
-        for nombre, color in [("Seleccionados", "#B5D4F4"), ("Reuniones", "#1D9E75"),
-                              ("Presupuestos", "#F4A835"), ("Clientes", "#0C447C")]:
-            fig.add_bar(name=nombre, x=evo["periodo"], y=evo[nombre], marker_color=color,
-                        marker_line_width=0, text=evo[nombre].where(evo[nombre] > 0, None),
-                        textposition="outside")
-        fig.update_layout(barmode="group", height=380,
-                          legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                          margin=dict(l=10, r=10, t=30, b=10), **PLOT_LAYOUT)
-        st.plotly_chart(fig, use_container_width=True)
+        st.markdown("### 📊 KPIs semana a semana")
         st.caption(
-            "Seleccionados = entradas en Selección · Reuniones = entradas en Reunión · "
-            "Presupuestos = entradas en *Solicitud presupuesto proveedor* · Clientes = entradas en *Cierre ganado*. "
-            f"No se cuentan los movimientos en bloque de la reorganización del {pd.Timestamp(MIGRACION_DIA).strftime('%d/%m/%Y')}."
+            "Visitas = negocios que pasan a la etapa **Reunión** · Reuniones = reuniones registradas como actividad en HubSpot · "
+            "Presupuestos = negocios que pasan a **Solicitud presupuesto proveedor** · Clientes = **Cierre ganado**. "
+            "Semanas según el calendario (de lunes a domingo)."
         )
-        with st.expander("Ver tabla"):
-            st.dataframe(evo.rename(columns={"periodo": "Período"}), hide_index=True, use_container_width=True)
+        k1, k2, k3, k4 = st.columns([1.1, 1.6, 1.6, 1.4])
+        with k1:
+            frecuencia = st.radio("Ver por", ["Semana", "Mes"], horizontal=True, key="kpi_freq")
+        with k2:
+            n_per = st.slider(
+                "Número de semanas" if frecuencia == "Semana" else "Número de meses",
+                min_value=4, max_value=26 if frecuencia == "Semana" else 12,
+                value=8 if frecuencia == "Semana" else 6, key="kpi_n",
+            )
+        owners_kpi = sorted(df_lead["owner"].dropna().unique())
+        with k3:
+            owner_kpi = st.selectbox("Comercial", ["Todo el equipo"] + owners_kpi, key="kpi_owner")
+        with k4:
+            cargar_reuniones = st.checkbox(
+                "Contar reuniones de HubSpot", value=True, key="kpi_meet",
+                help="Descarga las reuniones registradas como actividad en HubSpot. Tarda unos segundos más.",
+            )
 
-        st.divider()
-        st.markdown(f"##### Por comercial — {week_label}")
-        kpc = kpis_por_comercial(df_lead, week_start, week_end)
-        if kpc.empty:
-            st.info("Sin movimientos en el período seleccionado.")
+        periodos = periodos_kpi(frecuencia, n_per, today)
+        periodos_sem = periodos_kpi("Semana", 26, today)
+        periodos_mes = periodos_kpi("Mes", 12, today)
+
+        meetings_df = None
+        if cargar_reuniones:
+            desde = min(periodos[0][1], periodos_sem[0][1], periodos_mes[0][1])
+            desde_ms = int(pd.Timestamp(desde).tz_localize(TZ_ESPANA).timestamp() * 1000)
+            hasta_ms = int(pd.Timestamp(today).tz_localize(TZ_ESPANA).timestamp() * 1000) + 86_400_000
+            with st.spinner("Cargando reuniones de HubSpot..."):
+                meetings_df = cached_meetings(api_key, desde_ms, hasta_ms)
+            if owner_filter and meetings_df is not None:
+                meetings_df = meetings_df[meetings_df["owner"].isin(owner_filter)]
+            if st.session_state.get("_meetings_error"):
+                st.warning(f"No se han podido leer las reuniones de HubSpot: {st.session_state['_meetings_error']}")
+
+        eventos = kpi_eventos(df_lead, meetings_df)
+        kpis_vista = KPI_ORDEN if cargar_reuniones else [k for k in KPI_ORDEN if k != "Reuniones"]
+        sel_owner = None if owner_kpi == "Todo el equipo" else owner_kpi
+        tabla = tabla_kpis(eventos, periodos, kpis=kpis_vista, owner=sel_owner)
+
+        # Cifras del último período COMPLETO comparadas con el anterior
+        # (el período en curso está a medias y siempre saldría "a la baja")
+        col_act, col_ant = tabla.columns[-3], tabla.columns[-4]
+        nombre_per = "semana" if frecuencia == "Semana" else "mes"
+        st.markdown(f"##### Último {nombre_per} completo: {col_act} — comparado con {col_ant}")
+        mc = st.columns(len(kpis_vista))
+        for c, k in zip(mc, kpis_vista):
+            act, ant = int(tabla.loc[k, col_act]), int(tabla.loc[k, col_ant])
+            c.metric(k, act, f"{act - ant:+d} vs anterior" if (act or ant) else None,
+                     help=KPI_DESCRIPCION[k])
+        st.caption(f"La última columna del cuadro de mando ({tabla.columns[-2]}) es el {nombre_per} en curso: "
+                   f"sus cifras irán subiendo hasta que termine.")
+
+        # Cuadro de mando: KPIs × semanas
+        st.markdown("##### Cuadro de mando")
+        st.dataframe(
+            estilo_degradado(tabla, rgb=(24, 95, 165), por_fila=True),
+            use_container_width=True,
+        )
+
+        # Evolución en gráfico
+        fig = go.Figure()
+        colores = {"Seleccionados": "#B5D4F4", "Visitas": "#1D9E75", "Reuniones": "#7F77DD",
+                   "Presupuestos": "#F4A835", "Clientes": "#0C447C"}
+        x_lbl = [c.split(" · ")[0] for c in tabla.columns[:-1]]
+        for k in kpis_vista:
+            fig.add_scatter(x=x_lbl, y=tabla.loc[k, tabla.columns[:-1]], name=k, mode="lines+markers",
+                            line=dict(color=colores[k], width=2.5), marker=dict(size=7))
+        fig.update_layout(height=340, legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                          margin=dict(l=10, r=10, t=30, b=10), **PLOT_LAYOUT)
+        fig.update_yaxes(rangemode="tozero")
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Por comercial
+        st.markdown("##### Por comercial")
+        kpi_sel = st.selectbox("KPI", kpis_vista, index=kpis_vista.index("Visitas"), key="kpi_sel")
+        tc = tabla_comercial_periodo(eventos, periodos, kpi_sel)
+        if tc.empty:
+            st.info(f"Ningún comercial tiene {kpi_sel.lower()} en estos períodos.")
         else:
-            st.dataframe(kpc, hide_index=True, use_container_width=True)
+            st.dataframe(
+                estilo_degradado(tc, rgb=(29, 158, 117), por_fila=False),
+                use_container_width=True,
+            )
+
+        with st.expander("🔎 Ver el detalle (qué negocio o reunión cuenta en cada KPI)"):
+            ini_det = periodos[0][1]
+            det = eventos[eventos["fecha"] >= ini_det]
+            if sel_owner:
+                det = det[det["owner"] == sel_owner]
+            det = det.sort_values("fecha", ascending=False)
+            st.dataframe(pd.DataFrame({
+                "Fecha":     det["fecha"].dt.strftime("%d/%m/%Y"),
+                "Semana":    det["semana"],
+                "KPI":       det["kpi"],
+                "Comercial": det["owner"],
+                "Negocio / reunión": det["detalle"],
+            }), hide_index=True, use_container_width=True, height=min(450, 55 + len(det) * 35))
+
+        # Exportar
+        rango_txt = (f"Semanas {periodos_sem[0][0].split(' · ')[0]} a {periodos_sem[-1][0].split(' · ')[0]} · "
+                     f"meses {periodos_mes[0][0]} a {periodos_mes[-1][0]} · generado {today.strftime('%d/%m/%Y %H:%M')}")
+        xls_kpis = excel_kpis(eventos, periodos_sem, periodos_mes, rango_txt)
+        st.download_button(
+            "⬇️ Descargar KPIs en Excel",
+            data=xls_kpis,
+            file_name=f"KPIs_leads_{today.strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            help="Hojas: KPIs semanales (26 semanas), KPIs mensuales (12 meses), por comercial, detalle y definiciones.",
+        )
 
 # ── TAB 1: COMERCIALES ─────────────────────────
 
