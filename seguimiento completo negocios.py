@@ -869,7 +869,7 @@ def excel_semana(tabla1, tabla2, semana, hoy):
     wb = Workbook()
     ws = wb.active
     ws.title = "Esta semana"
-    xl_header(ws, f"Seguimiento semanal — {semana}", f"Generado el {hoy.strftime('%d/%m/%Y %H:%M')}", 5)
+    xl_header(ws, f"Seguimiento semanal — {semana}", f"Generado el {hoy.strftime('%d/%m/%Y %H:%M')}", 6)
     r = 4
     ws.cell(r, 1, "¿Cómo va cada comercial?").font = Font(name="Arial", size=11, bold=True, color="1A3A5C")
     r += 1
@@ -1974,7 +1974,11 @@ tabs = st.tabs([
 
 # ── TAB 0: ESTA SEMANA (versión sencilla) ──────
 
-KPIS_SEMANA = ["Visitas", "Reuniones", "Presupuestos", "Clientes"]
+# Los tres KPIs de leads (todos salen de las etapas del pipeline LEAD):
+#   Visitas      = el negocio pasa a la etapa Reunión
+#   Presupuestos = el negocio pasa a Solicitud presupuesto proveedor
+#   Clientes     = el negocio pasa a Cierre ganado
+KPIS_SEMANA = ["Visitas", "Presupuestos", "Clientes"]
 
 with tabs[0]:
     lunes_hoy   = (pd.Timestamp(today) - pd.Timedelta(days=today.weekday())).normalize()
@@ -1984,28 +1988,37 @@ with tabs[0]:
     if df_lead.empty:
         st.info("No hay negocios del pipeline LEAD con los filtros actuales.")
     else:
+        eventos = kpi_eventos(df_lead)   # visitas, presupuestos y clientes con su fecha
+        ev_semana = eventos[(eventos["fecha"] >= lunes_hoy) & (eventos["fecha"] <= pd.Timestamp(today))]
+
         # ── Tabla 1: cómo va cada comercial ──
         st.markdown("##### ¿Cómo va cada comercial?")
         cupo_df, _sel, _reu, _desc = cupo_semanal(
             df_lead, lunes_hoy.to_pydatetime(), today, today, cupo_comercial, semanas_caducidad
         )
-        if cupo_df.empty:
-            tabla1 = pd.DataFrame(columns=["Comercial", "Trabajando ahora", "Visitas esta semana", "Huecos libres"])
-            st.info("Todavía ningún comercial tiene negocios en Selección.")
+        en_sel = dict(zip(cupo_df["owner"], cupo_df["en_seleccion"])) if not cupo_df.empty else {}
+        owners_t1 = sorted(set(en_sel) | set(ev_semana.loc[ev_semana["kpi"].isin(KPIS_SEMANA), "owner"]))
+
+        cols_t1 = ["Comercial", "Trabajando ahora", "Visitas", "Presupuestos", "Clientes", "Huecos libres"]
+        filas = []
+        for o in owners_t1:
+            ev_o = ev_semana[ev_semana["owner"] == o]
+            n_sel = int(en_sel.get(o, 0))
+            filas.append({
+                "Comercial":        o,
+                "Trabajando ahora": n_sel,
+                "Visitas":          int((ev_o["kpi"] == "Visitas").sum()),
+                "Presupuestos":     int((ev_o["kpi"] == "Presupuestos").sum()),
+                "Clientes":         int((ev_o["kpi"] == "Clientes").sum()),
+                "Huecos libres":    max(cupo_comercial - n_sel, 0),
+            })
+        tabla1 = pd.DataFrame(filas, columns=cols_t1)
+        if tabla1.empty:
+            st.info("Todavía ningún comercial tiene negocios en Selección ni KPIs esta semana.")
         else:
-            tabla1 = pd.DataFrame({
-                "Comercial":           cupo_df["owner"],
-                "Trabajando ahora":    cupo_df["en_seleccion"],
-                "Visitas esta semana": cupo_df["reuniones"],
-                "Huecos libres":       cupo_df["huecos_libres"],
-            }).sort_values("Comercial")
-            total = pd.DataFrame([{
-                "Comercial":           "TOTAL",
-                "Trabajando ahora":    int(tabla1["Trabajando ahora"].sum()),
-                "Visitas esta semana": int(tabla1["Visitas esta semana"].sum()),
-                "Huecos libres":       int(tabla1["Huecos libres"].sum()),
-            }])
-            tabla1 = pd.concat([tabla1, total], ignore_index=True)
+            total = {"Comercial": "TOTAL"}
+            total.update({c: int(tabla1[c].sum()) for c in cols_t1[1:]})
+            tabla1 = pd.concat([tabla1, pd.DataFrame([total])], ignore_index=True)
             st.dataframe(
                 tabla1.style.apply(
                     lambda fila: ["font-weight: bold" if fila["Comercial"] == "TOTAL" else "" for _ in fila],
@@ -2014,30 +2027,21 @@ with tabs[0]:
                 hide_index=True, use_container_width=True,
             )
         st.caption(
-            f"**Trabajando ahora** = negocios en la etapa Selección. "
-            f"**Visitas** = negocios que han pasado a la etapa Reunión desde el lunes. "
+            f"Visitas, presupuestos y clientes cuentan desde el lunes. "
+            f"**Trabajando ahora** = negocios en Selección. "
             f"**Huecos libres** = {cupo_comercial} − trabajando ahora: cuántos negocios nuevos se le pueden dar."
         )
 
         # ── Tabla 2: semana a semana ──
         st.markdown("##### ¿Cómo vamos semana a semana?")
         periodos4 = periodos_kpi("Semana", 4, today)
-        desde_ms = int(pd.Timestamp(periodos4[0][1]).tz_localize(TZ_ESPANA).timestamp() * 1000)
-        hasta_ms = int(pd.Timestamp(today).tz_localize(TZ_ESPANA).timestamp() * 1000) + 86_400_000
-        with st.spinner("Cargando reuniones de HubSpot..."):
-            meetings_df = cached_meetings(api_key, desde_ms, hasta_ms)
-        if owner_filter and meetings_df is not None and not meetings_df.empty:
-            meetings_df = meetings_df[meetings_df["owner"].isin(owner_filter)]
-        if st.session_state.get("_meetings_error"):
-            st.warning("No se han podido leer las reuniones de HubSpot; la fila Reuniones puede salir a 0.")
-
-        eventos = kpi_eventos(df_lead, meetings_df)
         tabla2 = tabla_kpis(eventos, periodos4, kpis=KPIS_SEMANA).drop(columns=["Total"])
         tabla2.columns = [c.split(" · ")[0] for c in tabla2.columns]
         st.dataframe(tabla2, use_container_width=True)
         st.caption(
-            f"**Visitas** = negocios que pasan a Reunión · **Reuniones** = reuniones registradas en HubSpot · "
-            f"**Presupuestos** = pasan a Solicitud presupuesto proveedor · **Clientes** = pasan a Cierre ganado. "
+            f"**Visitas** = negocios que pasan a la etapa Reunión · "
+            f"**Presupuestos** = pasan a Solicitud presupuesto proveedor · "
+            f"**Clientes** = pasan a Cierre ganado (pipeline LEAD). "
             f"La columna {semana_hoy} es la semana en curso."
         )
 
