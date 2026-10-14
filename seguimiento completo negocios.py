@@ -802,6 +802,7 @@ def kpi_eventos(df_lead, meetings_df=None):
         partes.append(pd.DataFrame({
             "fecha": sub[col].values, "kpi": kpi,
             "owner": sub["owner"].values, "detalle": sub["dealname"].values,
+            "deal_id": sub["deal_id"].astype(str).values,
         }))
     if meetings_df is not None and not meetings_df.empty:
         m = meetings_df[meetings_df["fecha"].notna()]
@@ -864,7 +865,7 @@ def tabla_comercial_periodo(eventos, periodos, kpi):
     tabla.index.name = "Comercial"
     return tabla
 
-def excel_semana(tabla1, tabla2, semana, hoy):
+def excel_semana(tabla1, tabla2, semana, hoy, detalle_df=None):
     """Excel sencillo con las dos tablas de la pestaña 'Esta semana'."""
     wb = Workbook()
     ws = wb.active
@@ -903,6 +904,24 @@ def excel_semana(tabla1, tabla2, semana, hoy):
             ws.cell(r, ci, int(v))
     xl_style_data(ws, ini, r, len(cols2))
     xl_auto_width(ws)
+
+    # Hoja con los negocios que hay detrás de cada número
+    if detalle_df is not None and not detalle_df.empty:
+        wd = wb.create_sheet("Negocios")
+        cols3 = list(detalle_df.columns)
+        xl_header(wd, "Qué negocios son", "Visitas, presupuestos y clientes de las últimas 4 semanas", len(cols3))
+        for ci, h in enumerate(cols3, 1):
+            wd.cell(4, ci, h)
+        xl_style_headers(wd, 4, len(cols3))
+        r3 = 4
+        for _, fila in detalle_df.iterrows():
+            r3 += 1
+            for ci, c in enumerate(cols3, 1):
+                wd.cell(r3, ci, str(fila[c]))
+        xl_style_data(wd, 5, r3, len(cols3))
+        xl_auto_width(wd, max_w=50)
+        wd.freeze_panes = "A5"
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -2045,9 +2064,44 @@ with tabs[0]:
             f"La columna {semana_hoy} es la semana en curso."
         )
 
+        # ── Qué negocios hay detrás de cada número ──
+        ini4 = periodos4[0][1]
+        det = eventos[(eventos["kpi"].isin(KPIS_SEMANA)) & (eventos["fecha"] >= ini4)].copy()
+        etapa_actual = dict(zip(df_lead["deal_id"].astype(str), df_lead["dealstage"]))
+        if "deal_id" in det.columns:
+            det["etapa"] = det["deal_id"].map(etapa_actual).map(STAGE_LABELS).fillna("—")
+        else:
+            det["etapa"] = "—"
+        det = det.sort_values(["fecha"], ascending=False)
+        detalle_df = pd.DataFrame({
+            "Semana":       det["semana"],
+            "Fecha":        det["fecha"].dt.strftime("%d/%m/%Y"),
+            "KPI":          det["kpi"],
+            "Negocio":      det["detalle"],
+            "Comercial":    det["owner"],
+            "Etapa actual": det["etapa"],
+        })
+        with st.expander(f"🔎 Ver qué negocios son ({len(detalle_df)})"):
+            if detalle_df.empty:
+                st.info("No hay visitas, presupuestos ni clientes en estas 4 semanas.")
+            else:
+                f1, f2 = st.columns(2)
+                with f1:
+                    kpi_f = st.selectbox("KPI", ["Todos"] + KPIS_SEMANA, key="det_kpi")
+                with f2:
+                    sem_f = st.selectbox("Semana", ["Todas"] + list(tabla2.columns)[::-1], key="det_sem")
+                ver = detalle_df
+                if kpi_f != "Todos":
+                    ver = ver[ver["KPI"] == kpi_f]
+                if sem_f != "Todas":
+                    ver = ver[ver["Semana"] == sem_f]
+                st.caption(f"**{len(ver)}** negocios")
+                st.dataframe(ver, hide_index=True, use_container_width=True,
+                             height=min(450, 55 + len(ver) * 35))
+
         st.download_button(
             "⬇️ Descargar en Excel",
-            data=excel_semana(tabla1, tabla2, semana_hoy, today),
+            data=excel_semana(tabla1, tabla2, semana_hoy, today, detalle_df),
             file_name=f"Seguimiento_semanal_{semana_hoy.replace(' ', '')}_{today.strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
