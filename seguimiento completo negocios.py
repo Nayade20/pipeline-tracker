@@ -106,7 +106,7 @@ ST_BBDD        = "1452888180"
 ST_SELECCION   = "1452887693"
 ST_REUNION     = "1452880567"
 ST_DESCARTADO  = "1397904426"
-ST_PRESUPUESTO = "975190033"   # Solicitud presupuesto proveedor (lead)
+ST_PRESUPUESTO = "974964837"   # Facturas recibidas (lead) — cuenta como presupuesto
 ST_GANADO_LEAD = "991037466"   # Cierre ganado
 
 # Etapas de análisis (después de la reunión y antes del cierre)
@@ -751,7 +751,7 @@ KPI_DESCRIPCION = {
     "Seleccionados": "Negocios que entran en la etapa Selección (pasan al cupo)",
     "Visitas":       "Negocios que entran en la etapa Reunión del pipeline LEAD",
     "Reuniones":     "Reuniones registradas como actividad en HubSpot (sin canceladas)",
-    "Presupuestos":  "Negocios que entran en Solicitud presupuesto proveedor (LEAD)",
+    "Presupuestos":  "Negocios que entran en Facturas recibidas (LEAD)",
     "Clientes":      "Negocios que entran en Cierre ganado (LEAD)",
 }
 
@@ -1995,7 +1995,7 @@ tabs = st.tabs([
 
 # Los tres KPIs de leads (todos salen de las etapas del pipeline LEAD):
 #   Visitas      = el negocio pasa a la etapa Reunión
-#   Presupuestos = el negocio pasa a Solicitud presupuesto proveedor
+#   Presupuestos = el negocio entra en Facturas recibidas (se cuenta en la semana en que entra)
 #   Clientes     = el negocio pasa a Cierre ganado
 KPIS_SEMANA = ["Visitas", "Presupuestos", "Clientes"]
 
@@ -2059,7 +2059,7 @@ with tabs[0]:
         st.dataframe(tabla2, use_container_width=True)
         st.caption(
             f"**Visitas** = negocios que pasan a la etapa Reunión · "
-            f"**Presupuestos** = pasan a Solicitud presupuesto proveedor · "
+            f"**Presupuestos** = entran en Facturas recibidas · "
             f"**Clientes** = pasan a Cierre ganado (pipeline LEAD). "
             f"La columna {semana_hoy} es la semana en curso."
         )
