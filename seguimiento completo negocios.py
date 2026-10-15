@@ -2162,6 +2162,44 @@ with tabs[0]:
             f"**Huecos libres** = {cupo_comercial} − trabajando ahora: cuántos negocios nuevos se le pueden dar."
         )
 
+        # ── Qué negocios tiene cada comercial y por qué cuentan ──
+        if owners_t1:
+            with st.expander("🔎 Ver los negocios de cada comercial"):
+                com = st.selectbox("Comercial", owners_t1, key=f"com_{pipe_nombre}")
+                etapa_hoy = dict(zip(df_tab["deal_id"].astype(str), df_tab["dealstage"]))
+
+                # 1) Trabajando ahora = en Selección
+                sel_c = _sel[_sel["owner"] == com].sort_values("fecha_seleccion")
+                st.markdown(f"**Trabajando ahora ({len(sel_c)})** — están en la etapa Selección")
+                if sel_c.empty:
+                    st.caption("No tiene negocios en Selección.")
+                else:
+                    st.dataframe(pd.DataFrame({
+                        "Negocio":              sel_c["dealname"],
+                        "En Selección desde":   sel_c["fecha_seleccion"].dt.strftime("%d/%m/%Y").fillna("—"),
+                        "Semanas en Selección": sel_c["semanas_en_seleccion"],
+                        "Última actividad":     sel_c["notes_last_updated"].dt.strftime("%d/%m/%Y").fillna("—"),
+                    }), hide_index=True, use_container_width=True,
+                        height=min(400, 55 + len(sel_c) * 35))
+
+                # 2) Visitas, presupuestos y clientes de esta semana
+                ev_c = ev_semana[(ev_semana["owner"] == com) & ev_semana["kpi"].isin(KPIS_SEMANA)].sort_values("fecha")
+                st.markdown(f"**Esta semana ({len(ev_c)})** — visitas, presupuestos y clientes desde el lunes")
+                if ev_c.empty:
+                    st.caption("Esta semana todavía no ha sumado visitas, presupuestos ni clientes.")
+                else:
+                    motivo = {
+                        "Visitas":      f"Entró en {nom_etapa('f_reunion')}",
+                        "Presupuestos": f"Entró en {nom_etapa('f_presupuesto')}",
+                        "Clientes":     f"Entró en {nom_etapa('f_ganado')}",
+                    }
+                    st.dataframe(pd.DataFrame({
+                        "KPI":          ev_c["kpi"],
+                        "Negocio":      ev_c["detalle"],
+                        "Por qué cuenta": ev_c["kpi"].map(motivo) + " el " + ev_c["fecha"].dt.strftime("%d/%m"),
+                        "Etapa actual": ev_c["deal_id"].map(etapa_hoy).map(STAGE_LABELS).fillna("—"),
+                    }), hide_index=True, use_container_width=True)
+
         # ── Tabla 2: semana a semana ──
         st.markdown("##### ¿Cómo vamos semana a semana?")
         periodos4 = periodos_kpi("Semana", 4, today)
