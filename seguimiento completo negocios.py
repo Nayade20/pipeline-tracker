@@ -121,16 +121,40 @@ MIGRACION_DIA = "2026-10-06"
 CUPO_POR_DEFECTO      = 20
 SEMANAS_CADUCIDAD_DEF = 3
 
-# Fecha de entrada en cada etapa que se descarga de HubSpot
-# (clave = id de etapa, valor = nombre de la columna en la app)
-TRACKED_STAGE_DATES = {
-    ST_BBDD:        "f_bbdd",
-    ST_SELECCION:   "f_seleccion",
-    ST_REUNION:     "f_reunion",
-    ST_DESCARTADO:  "f_descartado",
-    ST_PRESUPUESTO: "f_presupuesto",
-    ST_GANADO_LEAD: "f_ganado",
+# ─────────────────────────────────────────────
+# ETAPAS CLAVE DE CADA PIPELINE (LEAD y CLIENTES)
+# ─────────────────────────────────────────────
+# Para cada pipeline: qué etapa es BBDD, Selección, Reunión (= visita),
+# Facturas recibidas (= presupuesto), ganado (= cliente) y descartado.
+# Si un id es None, la app lo busca en HubSpot por el NOMBRE de la etapa
+# (así reconoce etapas nuevas sin tocar el código).
+# "migracion" = día en que se reorganizó el pipeline moviendo negocios en bloque:
+# las entradas de ese día NO cuentan como visitas, presupuestos ni clientes.
+DATE_COLS = ["f_bbdd", "f_seleccion", "f_reunion", "f_descartado", "f_presupuesto", "f_ganado"]
+
+PIPE_CONFIG = {
+    LEAD_PIPELINE_ID: {
+        "nombre": "LEAD", "migracion": "2026-10-06",
+        "ids":    {"f_bbdd": ST_BBDD, "f_seleccion": ST_SELECCION, "f_reunion": ST_REUNION,
+                   "f_descartado": ST_DESCARTADO, "f_presupuesto": ST_PRESUPUESTO, "f_ganado": ST_GANADO_LEAD},
+        "nombres": {},
+    },
+    "default": {
+        "nombre": "CLIENTES", "migracion": "2026-10-14",
+        "ids":    {"f_bbdd": None, "f_seleccion": None, "f_reunion": None,
+                   "f_descartado": "996161568",   # Negocio perdido
+                   "f_presupuesto": "960918616",  # Facturas recibidas cliente
+                   "f_ganado": "990804832"},      # Negocio ganado
+        "nombres": {"f_bbdd": ["BBDD"], "f_seleccion": ["SELECCION"], "f_reunion": ["REUNION"],
+                    "f_presupuesto": ["FACTURAS RECIBIDAS CLIENTE", "FACTURAS RECBIDAS CLIENTE"],
+                    "f_ganado": ["NEGOCIO GANADO"], "f_descartado": ["NEGOCIO PERDIDO"]},
+    },
 }
+
+# Se rellenan al arrancar, después de leer los pipelines de HubSpot
+STAGE_MAP     = {}       # {pipeline_id: {"f_seleccion": id, ...}}
+SELECCION_IDS = {ST_SELECCION}
+BBDD_IDS      = {ST_BBDD}
 
 # Zona horaria de España — todas las fechas del dashboard se muestran en hora peninsular
 TZ_ESPANA = "Europe/Madrid"
@@ -162,7 +186,58 @@ def test_connection(api_key):
     except Exception:
         return False
 
-def get_all_deals(api_key):
+def get_pipelines(api_key):
+    """Etapas de cada pipeline de negocios en HubSpot: {pipeline_id: [(stage_id, nombre), ...]}."""
+    try:
+        data = hs_get(api_key, f"{BASE_URL}/crm/v3/pipelines/deals")
+    except Exception as e:
+        st.session_state["_pipelines_error"] = str(e)
+        return {}
+    return {
+        str(pl["id"]): [(str(stg["id"]), stg.get("label", "")) for stg in pl.get("stages", [])]
+        for pl in data.get("results", [])
+    }
+
+def _normaliza(txt):
+    import unicodedata
+    txt = unicodedata.normalize("NFKD", str(txt)).encode("ascii", "ignore").decode()
+    return " ".join(txt.upper().split())
+
+def resolver_etapas(pipes):
+    """
+    Decide qué etapa de cada pipeline es Selección, Reunión, etc.
+    Usa el id fijo si existe en HubSpot; si no, busca la etapa por su nombre.
+    También añade a STAGE_LABELS las etapas que el código todavía no conoce.
+    """
+    global STAGE_MAP, SELECCION_IDS, BBDD_IDS
+    for etapas in pipes.values():
+        for sid, nombre in etapas:
+            if sid not in STAGE_LABELS and nombre:
+                bonito = {"BBDD": "BBDD", "SELECCION": "Selección", "REUNION": "Reunión"}
+                STAGE_LABELS[sid] = bonito.get(_normaliza(nombre), nombre.strip().capitalize())
+    mapa = {}
+    for pid, cfg in PIPE_CONFIG.items():
+        etapas = pipes.get(pid, [])
+        ids_hs = {sid for sid, _ in etapas}
+        por_nombre = {_normaliza(n): sid for sid, n in etapas}
+        res = {}
+        for col in DATE_COLS:
+            fijo = cfg["ids"].get(col)
+            if fijo and (not etapas or fijo in ids_hs):
+                res[col] = fijo
+                continue
+            res[col] = None
+            for nombre in cfg["nombres"].get(col, []):
+                if _normaliza(nombre) in por_nombre:
+                    res[col] = por_nombre[_normaliza(nombre)]
+                    break
+        mapa[pid] = res
+    STAGE_MAP     = mapa
+    SELECCION_IDS = {m["f_seleccion"] for m in mapa.values() if m.get("f_seleccion")} or {ST_SELECCION}
+    BBDD_IDS      = {m["f_bbdd"] for m in mapa.values() if m.get("f_bbdd")} or {ST_BBDD}
+    return mapa
+
+def get_all_deals(api_key, stage_ids=()):
     props = [
         "dealname", "dealstage", "pipeline", "hubspot_owner_id",
         "amount", "createdate", "closedate",
@@ -170,7 +245,7 @@ def get_all_deals(api_key):
         "hs_v2_date_entered_current_stage",
     ]
     # Fecha de entrada en las etapas clave (versión nueva y antigua de HubSpot)
-    for _sid in TRACKED_STAGE_DATES:
+    for _sid in stage_ids:
         props.append(f"hs_v2_date_entered_{_sid}")
         props.append(f"hs_date_entered_{_sid}")
     all_deals = []
@@ -510,18 +585,22 @@ def parse_dt(val):
     except Exception:
         return pd.NaT
 
-def parse_deals(raw_deals):
+def parse_deals(raw_deals, stage_map=None):
+    stage_map = stage_map or {}
     rows = []
     for d in raw_deals:
         p = d.get("properties", {})
         owner_id    = str(p.get("hubspot_owner_id") or "")
         pipeline_id = str(p.get("pipeline") or "")
-        stage_dates = {
-            col: parse_dt(p.get(f"hs_v2_date_entered_{sid}") or p.get(f"hs_date_entered_{sid}"))
-            for sid, col in TRACKED_STAGE_DATES.items()
-        }
+        ids_pipe = stage_map.get(pipeline_id, {})
+        stage_dates = {}
+        for col in DATE_COLS:
+            sid = ids_pipe.get(col)
+            stage_dates[col] = (parse_dt(p.get(f"hs_v2_date_entered_{sid}") or p.get(f"hs_date_entered_{sid}"))
+                                if sid else pd.NaT)
         rows.append({
             **stage_dates,
+            "dia_migracion":      PIPE_CONFIG.get(pipeline_id, {}).get("migracion", ""),
             "f_etapa_actual":     parse_dt(p.get("hs_v2_date_entered_current_stage")),
             "deal_id":            d["id"],
             "dealname":           p.get("dealname", ""),
@@ -539,7 +618,7 @@ def parse_deals(raw_deals):
         })
     df = pd.DataFrame(rows)
     # Si una columna de fecha viene vacía en todos los negocios, asegurar tipo fecha
-    for col in list(TRACKED_STAGE_DATES.values()) + ["f_etapa_actual"]:
+    for col in DATE_COLS + ["f_etapa_actual"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
     return df
@@ -674,6 +753,11 @@ def stale_deals(df, thresholds, reference_date):
 # CUPO SEMANAL Y EMBUDO (pipeline LEAD)
 # ─────────────────────────────────────────────
 
+def _no_migracion(df, col):
+    """True si la entrada en la etapa NO fue el día en que se reorganizó su pipeline."""
+    dia = df["dia_migracion"].fillna("") if "dia_migracion" in df.columns else MIGRACION_DIA
+    return df[col].dt.strftime("%Y-%m-%d").fillna("") != dia
+
 def _en_periodo(serie, inicio, fin, excluir_migracion=False):
     """True si la fecha está dentro del período (opcionalmente sin el día de la migración)."""
     mask = serie.notna() & (serie >= inicio) & (serie <= fin)
@@ -694,7 +778,7 @@ def cupo_semanal(df_lead, inicio, fin, hoy, cupo, semanas_caducidad):
     Devuelve (resumen_por_comercial, negocios_en_seleccion).
     """
     df = df_lead.copy()
-    en_sel = df[df["dealstage"] == ST_SELECCION].copy()
+    en_sel = df[df["dealstage"].isin(SELECCION_IDS)].copy()
     fecha_sel = en_sel["f_seleccion"].fillna(en_sel["f_etapa_actual"])
     en_sel["fecha_seleccion"] = fecha_sel
     en_sel["semanas_en_seleccion"] = ((hoy - fecha_sel).dt.days // 7).fillna(0).astype(int)
@@ -708,8 +792,8 @@ def cupo_semanal(df_lead, inicio, fin, hoy, cupo, semanas_caducidad):
         return "🟢 En plazo"
     en_sel["estado"] = en_sel["semanas_en_seleccion"].apply(_estado)
 
-    reuniones   = df[_en_periodo(df["f_reunion"],    inicio, fin, excluir_migracion=True)]
-    descartados = df[_en_periodo(df["f_descartado"], inicio, fin, excluir_migracion=True)]
+    reuniones   = df[_en_periodo(df["f_reunion"],    inicio, fin) & _no_migracion(df, "f_reunion")]
+    descartados = df[_en_periodo(df["f_descartado"], inicio, fin) & _no_migracion(df, "f_descartado")]
 
     owners = sorted(set(en_sel["owner"]) | set(reuniones["owner"]) | set(descartados["owner"]))
     filas = []
@@ -787,8 +871,10 @@ def kpi_eventos(df_lead, meetings_df=None):
     fuentes = [
         ("Seleccionados", "f_seleccion",   False),
         ("Visitas",       "f_reunion",     True),
-        ("Presupuestos",  "f_presupuesto", True),
-        ("Clientes",      "f_ganado",      True),
+        # En la reorganización solo se movieron negocios en bloque a BBDD, Selección,
+        # Reunión y Descartado: por eso solo las visitas descartan el día de la migración.
+        ("Presupuestos",  "f_presupuesto", False),
+        ("Clientes",      "f_ganado",      False),
     ]
     partes = []
     for kpi, col, excl in fuentes:
@@ -796,7 +882,7 @@ def kpi_eventos(df_lead, meetings_df=None):
             continue
         sub = df_lead[df_lead[col].notna()]
         if excl:
-            sub = sub[sub[col].dt.strftime("%Y-%m-%d") != MIGRACION_DIA]
+            sub = sub[_no_migracion(sub, col)]
         if sub.empty:
             continue
         partes.append(pd.DataFrame({
@@ -909,7 +995,7 @@ def excel_semana(tabla1, tabla2, semana, hoy, detalle_df=None):
     if detalle_df is not None and not detalle_df.empty:
         wd = wb.create_sheet("Negocios")
         cols3 = list(detalle_df.columns)
-        xl_header(wd, "Qué negocios son", "Visitas, presupuestos y clientes de las últimas 4 semanas", len(cols3))
+        xl_header(wd, "Qué negocios son", f"Visitas, presupuestos y clientes de las últimas 4 semanas · {semana}", len(cols3))
         for ci, h in enumerate(cols3, 1):
             wd.cell(4, ci, h)
         xl_style_headers(wd, 4, len(cols3))
@@ -1024,7 +1110,7 @@ def _snapshots_to_json(snapshots: dict) -> str:
         # para que al recargar el snapshot las horas no se desplacen.
         df_save = snap["df_week"].copy()
         # Las fechas de entrada en etapas no hacen falta en los snapshots
-        _extra = [c for c in list(TRACKED_STAGE_DATES.values()) + ["f_etapa_actual"] if c in df_save.columns]
+        _extra = [c for c in DATE_COLS + ["f_etapa_actual", "dia_migracion"] if c in df_save.columns]
         if _extra:
             df_save = df_save.drop(columns=_extra)
         for col in date_cols:
@@ -1638,8 +1724,12 @@ div[data-testid="metric-container"] {
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_all_deals(api_key):
-    return parse_deals(get_all_deals(api_key))
+def cached_pipelines(api_key):
+    return get_pipelines(api_key)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_all_deals(api_key, stage_ids=(), stage_map_json="{}"):
+    return parse_deals(get_all_deals(api_key, stage_ids), json.loads(stage_map_json))
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_stage_history(api_key, deal_ids_tuple):
@@ -1798,23 +1888,29 @@ week_label = f"{start_date.strftime('%d/%m/%Y')} — {end_date.strftime('%d/%m/%
 today      = ahora_espana()
 
 with st.spinner("Cargando negocios de HubSpot..."):
-    df_all = cached_all_deals(api_key)
+    _pipes = cached_pipelines(api_key)
+    resolver_etapas(_pipes)
+    _stage_ids = tuple(sorted({sid for m in STAGE_MAP.values() for sid in m.values() if sid}))
+    df_all = cached_all_deals(api_key, _stage_ids, json.dumps(STAGE_MAP, sort_keys=True))
 
-if pipeline_filter:
-    df_all = df_all[df_all["pipeline"].isin(pipeline_filter)]
 if owner_filter:
     df_all = df_all[df_all["owner"].isin(owner_filter)]
 
-# Todos los negocios del pipeline LEAD (abiertos y cerrados) — para Cupo y Embudo
-df_lead = df_all[df_all["pipeline_id"] == LEAD_PIPELINE_ID].copy()
+# Todos los negocios (abiertos y cerrados) de todos los pipelines — para la pestaña "Esta semana",
+# que tiene su propio selector de pipeline (no depende del filtro de la barra lateral)
+df_kpi_base = df_all.copy()
+df_lead = df_kpi_base[df_kpi_base["pipeline_id"] == LEAD_PIPELINE_ID].copy()
+
+if pipeline_filter:
+    df_all = df_all[df_all["pipeline"].isin(pipeline_filter)]
 
 # A partir de aquí todo el dashboard trabaja SOLO con negocios abiertos
 df_closed = df_all[df_all["dealstage"].isin(CLOSED_STAGES)].copy()  # guardamos cerrados solo para cierres KPI
 df_all    = df_all[~df_all["dealstage"].isin(CLOSED_STAGES)].copy()
-n_bbdd    = int((df_all["dealstage"] == ST_BBDD).sum())
+n_bbdd    = int(df_all["dealstage"].isin(BBDD_IDS).sum())
 if not incluir_bbdd:
     # BBDD = reserva de empresas sin trabajar → fuera de actividad y estancados
-    df_all = df_all[df_all["dealstage"] != ST_BBDD].copy()
+    df_all = df_all[~df_all["dealstage"].isin(BBDD_IDS)].copy()
 
 # df_week basado en notes_last_updated — misma propiedad que usa HubSpot UI
 df_week = df_all[
@@ -1993,10 +2089,11 @@ tabs = st.tabs([
 
 # ── TAB 0: ESTA SEMANA (versión sencilla) ──────
 
-# Los tres KPIs de leads (todos salen de las etapas del pipeline LEAD):
-#   Visitas      = el negocio pasa a la etapa Reunión
-#   Presupuestos = el negocio entra en Facturas recibidas (se cuenta en la semana en que entra)
-#   Clientes     = el negocio pasa a Cierre ganado
+# Los tres KPIs (iguales en LEAD y CLIENTES; las etapas exactas están en PIPE_CONFIG):
+#   Visitas      = el negocio entra en la etapa Reunión
+#   Presupuestos = el negocio entra en Facturas recibidas
+#   Clientes     = el negocio entra en ganado (Cierre ganado en LEAD, Negocio ganado en CLIENTES)
+# Cada negocio cuenta una sola vez, en la semana en que entra en la etapa.
 KPIS_SEMANA = ["Visitas", "Presupuestos", "Clientes"]
 
 with tabs[0]:
@@ -2004,16 +2101,30 @@ with tabs[0]:
     semana_hoy  = etiqueta_semana(lunes_hoy)
     st.subheader(f"📋 Esta semana — {semana_hoy} (desde el lunes {lunes_hoy.strftime('%d/%m')})")
 
-    if df_lead.empty:
-        st.info("No hay negocios del pipeline LEAD con los filtros actuales.")
+    pipe_nombre = st.radio("Pipeline", ["LEAD", "CLIENTES"], horizontal=True, key="esta_pipe")
+    pipe_id   = LEAD_PIPELINE_ID if pipe_nombre == "LEAD" else "default"
+    ids_pipe  = STAGE_MAP.get(pipe_id, {})
+    df_tab    = df_kpi_base[df_kpi_base["pipeline_id"] == pipe_id].copy()
+    nom_etapa = lambda col: STAGE_LABELS.get(ids_pipe.get(col) or "", "—")
+    faltan    = [n for col, n in [("f_seleccion", "Selección"), ("f_reunion", "Reunión"),
+                                  ("f_presupuesto", "Facturas recibidas"), ("f_ganado", "ganado")]
+                 if not ids_pipe.get(col)]
+    if faltan:
+        st.warning(f"No encuentro en HubSpot estas etapas del pipeline {pipe_nombre}: {', '.join(faltan)}. "
+                   f"Revisa que se llamen así o avisa para ajustarlo.")
+    if st.session_state.get("_pipelines_error"):
+        st.warning(f"No se han podido leer los pipelines de HubSpot: {st.session_state['_pipelines_error']}")
+
+    if df_tab.empty:
+        st.info(f"No hay negocios del pipeline {pipe_nombre} con los filtros actuales.")
     else:
-        eventos = kpi_eventos(df_lead)   # visitas, presupuestos y clientes con su fecha
+        eventos = kpi_eventos(df_tab)   # visitas, presupuestos y clientes con su fecha
         ev_semana = eventos[(eventos["fecha"] >= lunes_hoy) & (eventos["fecha"] <= pd.Timestamp(today))]
 
         # ── Tabla 1: cómo va cada comercial ──
         st.markdown("##### ¿Cómo va cada comercial?")
         cupo_df, _sel, _reu, _desc = cupo_semanal(
-            df_lead, lunes_hoy.to_pydatetime(), today, today, cupo_comercial, semanas_caducidad
+            df_tab, lunes_hoy.to_pydatetime(), today, today, cupo_comercial, semanas_caducidad
         )
         en_sel = dict(zip(cupo_df["owner"], cupo_df["en_seleccion"])) if not cupo_df.empty else {}
         owners_t1 = sorted(set(en_sel) | set(ev_semana.loc[ev_semana["kpi"].isin(KPIS_SEMANA), "owner"]))
@@ -2058,16 +2169,18 @@ with tabs[0]:
         tabla2.columns = [c.split(" · ")[0] for c in tabla2.columns]
         st.dataframe(tabla2, use_container_width=True)
         st.caption(
-            f"**Visitas** = negocios que pasan a la etapa Reunión · "
-            f"**Presupuestos** = entran en Facturas recibidas · "
-            f"**Clientes** = pasan a Cierre ganado (pipeline LEAD). "
-            f"La columna {semana_hoy} es la semana en curso."
+            f"Pipeline {pipe_nombre}: **Visitas** = entran en *{nom_etapa('f_reunion')}* · "
+            f"**Presupuestos** = entran en *{nom_etapa('f_presupuesto')}* · "
+            f"**Clientes** = entran en *{nom_etapa('f_ganado')}*. "
+            f"La columna {semana_hoy} es la semana en curso. "
+            f"No cuentan como visitas los negocios movidos en bloque a Reunión el día de la reorganización "
+            f"({pd.Timestamp(PIPE_CONFIG[pipe_id]['migracion']).strftime('%d/%m/%Y')})."
         )
 
         # ── Qué negocios hay detrás de cada número ──
         ini4 = periodos4[0][1]
         det = eventos[(eventos["kpi"].isin(KPIS_SEMANA)) & (eventos["fecha"] >= ini4)].copy()
-        etapa_actual = dict(zip(df_lead["deal_id"].astype(str), df_lead["dealstage"]))
+        etapa_actual = dict(zip(df_tab["deal_id"].astype(str), df_tab["dealstage"]))
         if "deal_id" in det.columns:
             det["etapa"] = det["deal_id"].map(etapa_actual).map(STAGE_LABELS).fillna("—")
         else:
@@ -2087,9 +2200,9 @@ with tabs[0]:
             else:
                 f1, f2 = st.columns(2)
                 with f1:
-                    kpi_f = st.selectbox("KPI", ["Todos"] + KPIS_SEMANA, key="det_kpi")
+                    kpi_f = st.selectbox("KPI", ["Todos"] + KPIS_SEMANA, key=f"det_kpi_{pipe_nombre}")
                 with f2:
-                    sem_f = st.selectbox("Semana", ["Todas"] + list(tabla2.columns)[::-1], key="det_sem")
+                    sem_f = st.selectbox("Semana", ["Todas"] + list(tabla2.columns)[::-1], key=f"det_sem_{pipe_nombre}")
                 ver = detalle_df
                 if kpi_f != "Todos":
                     ver = ver[ver["KPI"] == kpi_f]
@@ -2101,8 +2214,8 @@ with tabs[0]:
 
         st.download_button(
             "⬇️ Descargar en Excel",
-            data=excel_semana(tabla1, tabla2, semana_hoy, today, detalle_df),
-            file_name=f"Seguimiento_semanal_{semana_hoy.replace(' ', '')}_{today.strftime('%Y%m%d')}.xlsx",
+            data=excel_semana(tabla1, tabla2, f"{semana_hoy} · {pipe_nombre}", today, detalle_df),
+            file_name=f"Seguimiento_semanal_{pipe_nombre}_{semana_hoy.replace(' ', '')}_{today.strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
