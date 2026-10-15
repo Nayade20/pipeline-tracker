@@ -210,11 +210,14 @@ def resolver_etapas(pipes):
     También añade a STAGE_LABELS las etapas que el código todavía no conoce.
     """
     global STAGE_MAP, SELECCION_IDS, BBDD_IDS
-    for etapas in pipes.values():
+    for pid_, etapas in pipes.items():
+        sufijo = " (cliente)" if pid_ == "default" else ""
         for sid, nombre in etapas:
             if sid not in STAGE_LABELS and nombre:
                 bonito = {"BBDD": "BBDD", "SELECCION": "Selección", "REUNION": "Reunión"}
-                STAGE_LABELS[sid] = bonito.get(_normaliza(nombre), nombre.strip().capitalize())
+                base = bonito.get(_normaliza(nombre), nombre.strip().capitalize())
+                # Mismo nombre que una etapa de LEAD → se distingue con "(cliente)"
+                STAGE_LABELS[sid] = base + sufijo if sufijo and not base.endswith(")") else base
     mapa = {}
     for pid, cfg in PIPE_CONFIG.items():
         etapas = pipes.get(pid, [])
@@ -2507,16 +2510,18 @@ with tabs[3]:
 # ── TAB 4: NUEVOS NEGOCIOS ─────────────────────
 
 with tabs[4]:
-    st.subheader("Negocios creados esta semana")
+    st.subheader(f"Negocios creados del {start_date.strftime('%d/%m')} al {end_date.strftime('%d/%m')}")
+    st.caption("Negocios con fecha de creación dentro del período de la barra lateral, y la etapa en la que están hoy. "
+               "Solo negocios abiertos" + ("" if incluir_bbdd else " y fuera de BBDD") + ".")
     if new_df.empty:
         st.info("No se crearon negocios nuevos en el período seleccionado.")
     else:
         c1, c2 = st.columns([1, 2])
         with c1:
-            st.metric("Total nuevos esta semana", int(new_df["new_deals"].sum()))
+            st.metric("Total nuevos en el período", int(new_df["new_deals"].sum()))
             st.dataframe(
                 new_df[["stage_label","new_deals"]].rename(columns={
-                    "stage_label":"Etapa inicial","new_deals":"Negocios"
+                    "stage_label":"Etapa actual","new_deals":"Negocios"
                 }),
                 hide_index=True, use_container_width=True,
             )
@@ -2528,6 +2533,28 @@ with tabs[4]:
             fig.update_traces(textposition="inside", textinfo="percent+label")
             fig.update_layout(showlegend=False, height=380, **PLOT_LAYOUT)
             st.plotly_chart(fig, use_container_width=True)
+
+        # ── Quiénes son y por qué están aquí ──
+        lista = nuevos_df.sort_values("createdate", ascending=False).copy()
+        lista["stage_label"] = lista["dealstage"].map(STAGE_LABELS).fillna(lista["dealstage"])
+        with st.expander(f"🔎 Ver qué negocios son ({len(lista)})"):
+            n1, n2 = st.columns(2)
+            with n1:
+                etapa_nf = st.selectbox("Etapa actual", ["Todas"] + sorted(lista["stage_label"].unique()), key="nuevos_etapa")
+            with n2:
+                com_nf = st.selectbox("Comercial", ["Todos"] + sorted(lista["owner"].unique()), key="nuevos_com")
+            if etapa_nf != "Todas":
+                lista = lista[lista["stage_label"] == etapa_nf]
+            if com_nf != "Todos":
+                lista = lista[lista["owner"] == com_nf]
+            st.caption(f"**{len(lista)}** negocios")
+            st.dataframe(pd.DataFrame({
+                "Negocio":           lista["dealname"],
+                "Comercial":         lista["owner"],
+                "Pipeline":          lista["pipeline"],
+                "Por qué está aquí": "Creado el " + lista["createdate"].dt.strftime("%d/%m/%Y"),
+                "Etapa actual":      lista["stage_label"],
+            }), hide_index=True, use_container_width=True, height=min(450, 55 + len(lista) * 35))
 
 # ── TAB 5: ESTANCADOS ──────────────────────────
 
