@@ -821,6 +821,29 @@ def cupo_semanal(df_lead, inicio, fin, hoy, cupo, semanas_caducidad):
         resumen = resumen.sort_values(["reuniones", "en_seleccion"], ascending=False)
     return resumen, en_sel, reuniones, descartados
 
+def en_seleccion_al_cierre(history_data, sel_ids, momento):
+    """
+    Negocios que estaban en la etapa Selección en un momento concreto (p. ej. el domingo
+    a las 23:59 de una semana pasada). Se reconstruye con el historial de etapas de HubSpot:
+    la etapa de cada negocio en ese momento es la última a la que entró antes de esa hora.
+    """
+    ids = set()
+    for did, info in history_data.items():
+        cambios = []
+        for e in info.get("stage_history", []):
+            ts = parse_dt(e.get("timestamp"))
+            if pd.notna(ts):
+                cambios.append((ts, str(e.get("value", ""))))
+        etapa = None
+        for ts, valor in sorted(cambios):
+            if ts <= momento:
+                etapa = valor
+            else:
+                break
+        if etapa in sel_ids:
+            ids.add(str(did))
+    return ids
+
 def embudo_lead(df_lead):
     """Número de negocios que hay ahora mismo en cada paso del embudo LEAD."""
     pasos = [
@@ -2122,32 +2145,61 @@ with tabs[0]:
         st.info(f"No hay negocios del pipeline {pipe_nombre} con los filtros actuales.")
     else:
         eventos = kpi_eventos(df_tab)   # visitas, presupuestos y clientes con su fecha
-        ev_semana = eventos[(eventos["fecha"] >= lunes_hoy) & (eventos["fecha"] <= pd.Timestamp(today))]
 
         # ── Tabla 1: cómo va cada comercial ──
         st.markdown("##### ¿Cómo va cada comercial?")
+
+        # Selector de semana (la semana en curso por defecto; hasta 8 semanas atrás)
+        semanas_sel = periodos_kpi("Semana", 8, today)[::-1]
+        def _nombre_sem(i):
+            etq, ini, fin = semanas_sel[i]
+            txt = f"{etq.split(' · ')[0]} ({ini.strftime('%d/%m')} – {fin.strftime('%d/%m')})"
+            return txt + " · en curso" if i == 0 else txt
+        i_sem = st.selectbox("Semana", list(range(len(semanas_sel))), format_func=_nombre_sem,
+                             key=f"sem_t1_{pipe_nombre}")
+        es_actual = i_sem == 0
+        sem_sel   = semanas_sel[i_sem][0].split(" · ")[0]
+        ini_sel, fin_sel = semanas_sel[i_sem][1], semanas_sel[i_sem][2]
+        ev_semana = eventos[(eventos["fecha"] >= ini_sel) & (eventos["fecha"] <= fin_sel)]
         cupo_df, _sel, _reu, _desc = cupo_semanal(
             df_tab, lunes_hoy.to_pydatetime(), today, today, cupo_comercial, semanas_caducidad
         )
-        en_sel = dict(zip(cupo_df["owner"], cupo_df["en_seleccion"])) if not cupo_df.empty else {}
+        if es_actual:
+            en_sel = dict(zip(cupo_df["owner"], cupo_df["en_seleccion"])) if not cupo_df.empty else {}
+            sel_cierre = pd.DataFrame()
+        else:
+            # Semana pasada: cuántos tenía cada comercial en Selección el domingo a las 23:59,
+            # reconstruido con el historial de etapas de los negocios que han pasado por Selección
+            candidatos = df_tab[df_tab["f_seleccion"].notna()]
+            ids_cierre = set()
+            if not candidatos.empty:
+                with st.spinner("Reconstruyendo cómo estaba cada comercial al cierre de la semana..."):
+                    hist = cached_stage_history(api_key, tuple(sorted(candidatos["deal_id"].astype(str))))
+                ids_cierre = en_seleccion_al_cierre(hist, SELECCION_IDS, fin_sel)
+            sel_cierre = df_tab[df_tab["deal_id"].astype(str).isin(ids_cierre)]
+            en_sel = sel_cierre.groupby("owner").size().to_dict()
+
         owners_t1 = sorted(set(en_sel) | set(ev_semana.loc[ev_semana["kpi"].isin(KPIS_SEMANA), "owner"]))
 
-        cols_t1 = ["Comercial", "Trabajando ahora", "Visitas", "Presupuestos", "Clientes", "Huecos libres"]
+        col_trab  = "Trabajando ahora" if es_actual else "Trabajando al cierre"
+        col_huec  = "Huecos libres" if es_actual else "Huecos libres al cierre"
+        cols_t1 = ["Comercial", col_trab, "Visitas", "Presupuestos", "Clientes", col_huec]
         filas = []
         for o in owners_t1:
             ev_o = ev_semana[ev_semana["owner"] == o]
             n_sel = int(en_sel.get(o, 0))
             filas.append({
                 "Comercial":        o,
-                "Trabajando ahora": n_sel,
+                col_trab:           n_sel,
                 "Visitas":          int((ev_o["kpi"] == "Visitas").sum()),
                 "Presupuestos":     int((ev_o["kpi"] == "Presupuestos").sum()),
                 "Clientes":         int((ev_o["kpi"] == "Clientes").sum()),
-                "Huecos libres":    max(cupo_comercial - n_sel, 0),
+                col_huec:           max(cupo_comercial - n_sel, 0),
             })
-        tabla1 = pd.DataFrame(filas, columns=cols_t1)
+        tabla1 = pd.DataFrame(filas)[cols_t1] if filas else pd.DataFrame(columns=cols_t1)
         if tabla1.empty:
-            st.info("Todavía ningún comercial tiene negocios en Selección ni KPIs esta semana.")
+            st.info("Ningún comercial tiene negocios en Selección ni visitas, presupuestos o clientes en esta semana."
+                    if es_actual else f"En la {sem_sel} no hubo visitas, presupuestos ni clientes.")
         else:
             total = {"Comercial": "TOTAL"}
             total.update({c: int(tabla1[c].sum()) for c in cols_t1[1:]})
@@ -2159,11 +2211,18 @@ with tabs[0]:
                 ),
                 hide_index=True, use_container_width=True,
             )
-        st.caption(
-            f"Visitas, presupuestos y clientes cuentan desde el lunes. "
-            f"**Trabajando ahora** = negocios en Selección. "
-            f"**Huecos libres** = {cupo_comercial} − trabajando ahora: cuántos negocios nuevos se le pueden dar."
-        )
+        if es_actual:
+            st.caption(
+                f"Visitas, presupuestos y clientes cuentan desde el lunes. "
+                f"**Trabajando ahora** = negocios en Selección. "
+                f"**Huecos libres** = {cupo_comercial} − trabajando ahora: cuántos negocios nuevos se le pueden dar."
+            )
+        else:
+            st.caption(
+                f"Visitas, presupuestos y clientes de la {sem_sel}, de lunes a domingo. "
+                f"**Trabajando al cierre** = negocios que estaban en Selección el domingo {fin_sel.strftime('%d/%m')} a las 23:59. "
+                f"**Huecos libres al cierre** = {cupo_comercial} − trabajando al cierre."
+            )
 
         # ── Qué negocios tiene cada comercial y por qué cuentan ──
         if owners_t1:
@@ -2171,10 +2230,24 @@ with tabs[0]:
                 com = st.selectbox("Comercial", owners_t1, key=f"com_{pipe_nombre}")
                 etapa_hoy = dict(zip(df_tab["deal_id"].astype(str), df_tab["dealstage"]))
 
-                # 1) Trabajando ahora = en Selección
+                # 1) Negocios en Selección: ahora (semana en curso) o al cierre (semana pasada)
                 sel_c = _sel[_sel["owner"] == com].sort_values("fecha_seleccion")
-                st.markdown(f"**Trabajando ahora ({len(sel_c)})** — están en la etapa Selección")
-                if sel_c.empty:
+                if es_actual:
+                    st.markdown(f"**Trabajando ahora ({len(sel_c)})** — están en la etapa Selección")
+                else:
+                    cierre_c = sel_cierre[sel_cierre["owner"] == com] if not sel_cierre.empty else sel_cierre
+                    st.markdown(f"**Trabajando al cierre ({len(cierre_c)})** — estaban en Selección el domingo {fin_sel.strftime('%d/%m')}")
+                    if cierre_c.empty:
+                        st.caption("No tenía negocios en Selección al cierre de esa semana.")
+                    else:
+                        st.dataframe(pd.DataFrame({
+                            "Negocio":      cierre_c["dealname"],
+                            "Etapa actual": cierre_c["dealstage"].map(STAGE_LABELS).fillna("—"),
+                        }), hide_index=True, use_container_width=True,
+                            height=min(400, 55 + len(cierre_c) * 35))
+                if not es_actual:
+                    pass
+                elif sel_c.empty:
                     st.caption("No tiene negocios en Selección.")
                 else:
                     st.dataframe(pd.DataFrame({
@@ -2187,9 +2260,10 @@ with tabs[0]:
 
                 # 2) Visitas, presupuestos y clientes de esta semana
                 ev_c = ev_semana[(ev_semana["owner"] == com) & ev_semana["kpi"].isin(KPIS_SEMANA)].sort_values("fecha")
-                st.markdown(f"**Esta semana ({len(ev_c)})** — visitas, presupuestos y clientes desde el lunes")
+                st.markdown(f"**{sem_sel} ({len(ev_c)})** — visitas, presupuestos y clientes"
+                            + (" desde el lunes" if es_actual else ""))
                 if ev_c.empty:
-                    st.caption("Esta semana todavía no ha sumado visitas, presupuestos ni clientes.")
+                    st.caption("No ha sumado visitas, presupuestos ni clientes en esta semana.")
                 else:
                     motivo = {
                         "Visitas":      f"Entró en {nom_etapa('f_reunion')}",
@@ -2255,8 +2329,8 @@ with tabs[0]:
 
         st.download_button(
             "⬇️ Descargar en Excel",
-            data=excel_semana(tabla1, tabla2, f"{semana_hoy} · {pipe_nombre}", today, detalle_df),
-            file_name=f"Seguimiento_semanal_{pipe_nombre}_{semana_hoy.replace(' ', '')}_{today.strftime('%Y%m%d')}.xlsx",
+            data=excel_semana(tabla1, tabla2, f"{sem_sel} · {pipe_nombre}", today, detalle_df),
+            file_name=f"Seguimiento_semanal_{pipe_nombre}_{sem_sel.replace(' ', '')}_{today.strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
