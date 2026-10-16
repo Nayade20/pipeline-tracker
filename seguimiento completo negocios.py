@@ -56,8 +56,8 @@ PIPELINE_NAMES = {
 }
 
 STAGE_LABELS = {
-    "960918614":  "Objetivo clientes familias nuevas",
-    "960918615":  "Presentadas nuevas familias — venta cruzada",
+    "960918614":  "Objetivo clientes familias nuevas (antigua)",
+    "960918615":  "Presentadas nuevas familias — venta cruzada (antigua)",
     "960918616":  "Facturas recibidas (cliente)",
     "960918617":  "Petición más info (cliente)",
     "960918618":  "Solicitud presupuesto proveedor (cliente)",
@@ -109,8 +109,6 @@ ST_DESCARTADO  = "1397904426"
 ST_PRESUPUESTO = "974964837"   # Facturas recibidas (lead) — cuenta como presupuesto
 ST_GANADO_LEAD = "991037466"   # Cierre ganado
 
-# Etapas de análisis (después de la reunión y antes del cierre)
-ANALISIS_STAGES = {"974964837", "975190032", "975190033", "975190034", "990996102", "990996103"}
 
 # Fecha en la que se reorganizó el pipeline LEAD: ese día se movieron
 # negocios en bloque a BBDD, Reunión y Descartado. Esas entradas NO cuentan
@@ -187,14 +185,15 @@ def test_connection(api_key):
         return False
 
 def get_pipelines(api_key):
-    """Etapas de cada pipeline de negocios en HubSpot: {pipeline_id: [(stage_id, nombre), ...]}."""
+    """Etapas de cada pipeline en HubSpot: {pipeline_id: [(stage_id, nombre, metadata), ...]}."""
     try:
         data = hs_get(api_key, f"{BASE_URL}/crm/v3/pipelines/deals")
     except Exception as e:
         st.session_state["_pipelines_error"] = str(e)
         return {}
     return {
-        str(pl["id"]): [(str(stg["id"]), stg.get("label", "")) for stg in pl.get("stages", [])]
+        str(pl["id"]): [(str(stg["id"]), stg.get("label", ""), stg.get("metadata", {}) or {})
+                        for stg in pl.get("stages", [])]
         for pl in data.get("results", [])
     }
 
@@ -203,6 +202,16 @@ def _normaliza(txt):
     txt = unicodedata.normalize("NFKD", str(txt)).encode("ascii", "ignore").decode()
     return " ".join(txt.upper().split())
 
+_ARREGLOS = {"RECBIDAS": "RECIBIDAS", "PETCION": "PETICIÓN", "PETCIÓN": "PETICIÓN", "PETICION": "PETICIÓN",
+             "INFORMACION": "INFORMACIÓN", "SELECCION": "SELECCIÓN", "REUNION": "REUNIÓN",
+             "SUBCONTRATACION": "SUBCONTRATACIÓN", "INTERES": "INTERÉS", "CUALIFICADA ": "CUALIFICADA"}
+
+def nombre_bonito(nombre):
+    """'FACTURAS RECBIDAS CLIENTE' → 'Facturas recibidas cliente' (corrige erratas y tildes)."""
+    palabras = [_ARREGLOS.get(w, w) for w in str(nombre).strip().upper().split()]
+    txt = " ".join(palabras).capitalize()
+    return txt.replace("Bbdd", "BBDD").replace("bbdd", "BBDD").replace("onura", "Onura").replace("rafa", "Rafa")
+
 def resolver_etapas(pipes):
     """
     Decide qué etapa de cada pipeline es Selección, Reunión, etc.
@@ -210,19 +219,36 @@ def resolver_etapas(pipes):
     También añade a STAGE_LABELS las etapas que el código todavía no conoce.
     """
     global STAGE_MAP, SELECCION_IDS, BBDD_IDS
+    # Nombres de etapa: SIEMPRE los que tiene ahora HubSpot (así una etapa renombrada
+    # sale con su nombre nuevo en todas las pestañas). Los nombres escritos en
+    # STAGE_LABELS solo se usan para etapas ya borradas o si HubSpot no responde.
+    nombres_lead = {_normaliza(n) for sid, n, *_ in pipes.get(LEAD_PIPELINE_ID, [])}
     for pid_, etapas in pipes.items():
-        sufijo = " (cliente)" if pid_ == "default" else ""
-        for sid, nombre in etapas:
-            if sid not in STAGE_LABELS and nombre:
-                bonito = {"BBDD": "BBDD", "SELECCION": "Selección", "REUNION": "Reunión"}
-                base = bonito.get(_normaliza(nombre), nombre.strip().capitalize())
-                # Mismo nombre que una etapa de LEAD → se distingue con "(cliente)"
-                STAGE_LABELS[sid] = base + sufijo if sufijo and not base.endswith(")") else base
+        for sid, nombre, *resto in etapas:
+            # Etapas marcadas como cerradas en HubSpot → se suman a las cerradas del código
+            meta = resto[0] if resto else {}
+            if str(meta.get("isClosed", "")).lower() == "true":
+                CLOSED_STAGES.add(sid)
+                try:
+                    prob = float(meta.get("probability"))
+                except (TypeError, ValueError):
+                    prob = None
+                if prob is not None and prob >= 1:
+                    WON_STAGES.add(sid)
+                elif prob is not None and prob <= 0:
+                    LOST_STAGES.add(sid)
+            if not nombre:
+                continue
+            base = nombre_bonito(nombre)
+            # Mismo nombre que una etapa de LEAD → la de CLIENTES lleva "(cliente)"
+            if pid_ == "default" and _normaliza(nombre) in nombres_lead:
+                base += " (cliente)"
+            STAGE_LABELS[sid] = base
     mapa = {}
     for pid, cfg in PIPE_CONFIG.items():
         etapas = pipes.get(pid, [])
-        ids_hs = {sid for sid, _ in etapas}
-        por_nombre = {_normaliza(n): sid for sid, n in etapas}
+        ids_hs = {sid for sid, *_ in etapas}
+        por_nombre = {_normaliza(n): sid for sid, n, *_ in etapas}
         res = {}
         for col in DATE_COLS:
             fijo = cfg["ids"].get(col)
@@ -393,8 +419,8 @@ def get_meetings(api_key, since_ts_ms, until_ts_ms):
 
 def get_stage_history_bulk(api_key, deal_ids):
     results = {}
-    for i in range(0, len(deal_ids), 10):
-        batch = deal_ids[i:i + 10]
+    for i in range(0, len(deal_ids), 50):
+        batch = deal_ids[i:i + 50]
         payload = {
             "inputs": [{"id": str(did)} for did in batch],
             "propertiesWithHistory": ["dealstage"],
@@ -626,6 +652,36 @@ def parse_deals(raw_deals, stage_map=None):
             df[col] = pd.to_datetime(df[col], errors="coerce")
     return df
 
+def completar_fechas_etapas(df, stage_map, history_data=None):
+    """
+    HubSpot NO crea la propiedad "fecha de entrada" para las etapas nuevas
+    (BBDD, Selección, Reunión...), así que esas fechas llegan vacías.
+    Se rellenan:
+      1) con el historial de etapas del negocio (última vez que entró en esa etapa);
+      2) si no hay historial, con la fecha de entrada en la etapa actual
+         cuando el negocio sigue en esa etapa.
+    """
+    df = df.copy()
+    history_data = history_data or {}
+    for col in DATE_COLS:
+        if col not in df.columns:
+            continue
+        sid_por_pipe = {pid: m.get(col) for pid, m in stage_map.items() if m.get(col)}
+        faltan = df[col].isna() & df["pipeline_id"].isin(sid_por_pipe.keys())
+        for idx in df.index[faltan]:
+            sid = sid_por_pipe[df.at[idx, "pipeline_id"]]
+            fecha = pd.NaT
+            hist = history_data.get(str(df.at[idx, "deal_id"]), {}).get("stage_history", [])
+            fechas = [parse_dt(h.get("timestamp")) for h in hist if str(h.get("value")) == str(sid)]
+            fechas = [f for f in fechas if pd.notna(f)]
+            if fechas:
+                fecha = max(fechas)
+            elif str(df.at[idx, "dealstage"]) == str(sid):
+                fecha = df.at[idx, "f_etapa_actual"]
+            df.at[idx, col] = fecha
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
+
 def activity_by_owner(df, week_start, week_end):
     """
     Usa notes_last_updated — misma propiedad que usa HubSpot para 'Última actividad'.
@@ -843,17 +899,6 @@ def en_seleccion_al_cierre(history_data, sel_ids, momento):
         if etapa in sel_ids:
             ids.add(str(did))
     return ids
-
-def embudo_lead(df_lead):
-    """Número de negocios que hay ahora mismo en cada paso del embudo LEAD."""
-    pasos = [
-        ("BBDD",        df_lead["dealstage"] == ST_BBDD),
-        ("Selección",   df_lead["dealstage"] == ST_SELECCION),
-        ("Reunión",     df_lead["dealstage"] == ST_REUNION),
-        ("En análisis", df_lead["dealstage"].isin(ANALISIS_STAGES)),
-        ("Cliente",     df_lead["dealstage"] == ST_GANADO_LEAD),
-    ]
-    return pd.DataFrame([{"paso": n, "negocios": int(m.sum())} for n, m in pasos])
 
 MESES_ES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
 KPI_ORDEN = ["Seleccionados", "Visitas", "Reuniones", "Presupuestos", "Clientes"]
@@ -1919,6 +1964,17 @@ with st.spinner("Cargando negocios de HubSpot..."):
     _stage_ids = tuple(sorted({sid for m in STAGE_MAP.values() for sid in m.values() if sid}))
     df_all = cached_all_deals(api_key, _stage_ids, json.dumps(STAGE_MAP, sort_keys=True))
 
+with st.spinner("Calculando fechas de entrada en las etapas nuevas..."):
+    # Solo hace falta el historial de los negocios tocados desde la reorganización
+    _desde = pd.Timestamp(min(c["migracion"] for c in PIPE_CONFIG.values())) - pd.Timedelta(days=1)
+    _ids_hist = df_all.loc[
+        df_all["pipeline_id"].isin(STAGE_MAP.keys())
+        & df_all[DATE_COLS].isna().any(axis=1)
+        & (df_all["last_modified"] >= _desde),
+        "deal_id"].astype(str)
+    _hist_fechas = cached_stage_history(api_key, tuple(sorted(_ids_hist))) if len(_ids_hist) else {}
+    df_all = completar_fechas_etapas(df_all, STAGE_MAP, _hist_fechas)
+
 if owner_filter:
     df_all = df_all[df_all["owner"].isin(owner_filter)]
 
@@ -2333,6 +2389,39 @@ with tabs[0]:
             file_name=f"Seguimiento_semanal_{pipe_nombre}_{sem_sel.replace(' ', '')}_{today.strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+    # ── Comprobar qué papel tiene cada etapa de HubSpot en la app ──
+    with st.expander(f"🔧 Comprobar etapas del pipeline {pipe_nombre}"):
+        st.caption("Lista de las etapas que tiene ahora este pipeline en HubSpot y para qué las usa la app. "
+                   "Sirve para comprobar que, tras cambiar etapas, cada una cuenta donde debe.")
+        papeles = {}
+        for col, papel in [("f_bbdd", "BBDD: reserva, fuera de actividad y estancados"),
+                           ("f_seleccion", "Selección: cupo (Trabajando / Huecos libres)"),
+                           ("f_reunion", "Visitas"),
+                           ("f_presupuesto", "Presupuestos"),
+                           ("f_ganado", "Clientes")]:
+            if ids_pipe.get(col):
+                papeles[ids_pipe[col]] = papel
+        cuenta = df_kpi_base[df_kpi_base["pipeline_id"] == pipe_id].groupby("dealstage").size()
+        filas_d = []
+        for sid, nombre, *_ in _pipes.get(pipe_id, []):
+            papel = papeles.get(sid, "")
+            if sid in WON_STAGES:
+                papel = (papel + " · " if papel else "") + "Cerrada (ganada)"
+            elif sid in CLOSED_STAGES:
+                papel = (papel + " · " if papel else "") + "Cerrada (no cuenta como abierta)"
+            filas_d.append({"Etapa en HubSpot": nombre, "Nombre en la app": STAGE_LABELS.get(sid, sid),
+                            "Papel en la app": papel or "Abierta", "Negocios ahora": int(cuenta.get(sid, 0)),
+                            "ID": sid})
+        if filas_d:
+            st.dataframe(pd.DataFrame(filas_d), hide_index=True, use_container_width=True)
+        else:
+            st.warning("No se han podido leer las etapas de este pipeline en HubSpot.")
+        ids_hs = {sid for sid, *_ in _pipes.get(pipe_id, [])}
+        huerfanos = {sid: n for sid, n in cuenta.items() if ids_hs and sid not in ids_hs}
+        if huerfanos:
+            st.warning("Hay negocios en etapas que ya no existen en HubSpot: "
+                       + ", ".join(f"{STAGE_LABELS.get(k, k)} ({v})" for k, v in huerfanos.items()))
 
 # ── TAB 1: COMERCIALES ─────────────────────────
 
@@ -2799,7 +2888,8 @@ with tabs[7]:
             df_all_snap = df_all_snap[df_all_snap["deal_id"].isin(all_ids)].copy()
             df_all_snap["dealstage"] = df_all_snap["dealstage"].astype(str).str.replace(r"\.0$", "", regex=True)
 
-            if "stage_label" not in df_all_snap.columns or df_all_snap["stage_label"].isna().all():
+            # Siempre con los nombres de etapa actuales de HubSpot (el snapshot puede ser antiguo)
+            if True:
                 df_all_snap["stage_label"] = df_all_snap["dealstage"].map(STAGE_LABELS).fillna(df_all_snap["dealstage"])
             else:
                 mask = (
