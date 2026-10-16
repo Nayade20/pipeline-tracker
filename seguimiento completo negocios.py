@@ -933,6 +933,26 @@ def estilo_degradado(tabla, rgb=(24, 95, 165), por_fila=True):
         return out
     return tabla.style.apply(_colorear, axis=None)
 
+def solo_ultima_etapa_semana(ev, df_deals):
+    """
+    Cada negocio cuenta solo por la ÚLTIMA etapa a la que entró en esa semana.
+    Ej.: entra en Reunión el miércoles y vuelve a Selección el jueves → no cuenta como visita.
+    Se quita el evento si el negocio entró en cualquier otra etapa más tarde esa misma semana.
+    """
+    if ev.empty or "deal_id" not in ev.columns or df_deals.empty:
+        return ev
+    cols = [c for c in DATE_COLS + ["f_etapa_actual"] if c in df_deals.columns]
+    entradas = df_deals[["deal_id"] + cols].copy()
+    entradas["deal_id"] = entradas["deal_id"].astype(str)
+    entradas = entradas.melt(id_vars="deal_id", value_name="f").dropna(subset=["f"])
+    entradas["f"] = pd.to_datetime(entradas["f"])
+    entradas["lunes"] = (entradas["f"] - pd.to_timedelta(entradas["f"].dt.weekday, unit="D")).dt.normalize()
+    ultima = entradas.groupby(["deal_id", "lunes"])["f"].max()
+    claves = list(zip(ev["deal_id"].astype(str), ev["lunes"]))
+    ult = pd.Series([ultima.get(k, pd.NaT) for k in claves], index=ev.index)
+    sin_negocio = ev["deal_id"].isna()   # p. ej. reuniones del calendario
+    return ev[sin_negocio | ult.isna() | (ev["fecha"] >= ult)].copy()
+
 def kpi_eventos(df_lead, meetings_df=None):
     """
     Lista de 'eventos' (una fila por cada visita, presupuesto, cliente...),
@@ -972,6 +992,7 @@ def kpi_eventos(df_lead, meetings_df=None):
     ev = pd.concat(partes, ignore_index=True)
     ev["fecha"]      = pd.to_datetime(ev["fecha"])
     ev["lunes"]      = (ev["fecha"] - pd.to_timedelta(ev["fecha"].dt.weekday, unit="D")).dt.normalize()
+    ev = solo_ultima_etapa_semana(ev, df_lead)
     ev["semana"]     = ev["fecha"].apply(etiqueta_semana)
     ev["mes_inicio"] = ev["fecha"].dt.to_period("M").dt.to_timestamp()
     ev["mes"]        = ev["mes_inicio"].apply(lambda d: f"{MESES_ES[d.month - 1]} {d.year}")
