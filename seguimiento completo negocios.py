@@ -173,9 +173,14 @@ def hs_get(api_key, url, params=None):
 
 def hs_post(api_key, url, payload):
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    resp = requests.post(url, headers=headers, json=payload, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    # Reintenta si HubSpot frena por exceso de peticiones (429) o falla puntualmente (5xx)
+    for intento in range(5):
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        if getattr(resp, "status_code", 200) in (429, 500, 502, 503, 504) and intento < 4:
+            time.sleep(2 * (intento + 1))
+            continue
+        resp.raise_for_status()
+        return resp.json()
 
 def test_connection(api_key):
     try:
@@ -879,8 +884,8 @@ def cupo_semanal(df_lead, inicio, fin, hoy, cupo, semanas_caducidad):
 
 def en_seleccion_al_cierre(history_data, sel_ids, momento):
     """
-    Negocios que estaban en la etapa Selección en un momento concreto (p. ej. el domingo
-    a las 23:59 de una semana pasada). Se reconstruye con el historial de etapas de HubSpot:
+    Negocios que estaban en la etapa Selección en un momento concreto (p. ej. el cierre
+    de una semana pasada). Se reconstruye con el historial de etapas de HubSpot:
     la etapa de cada negocio en ese momento es la última a la que entró antes de esa hora.
     """
     ids = set()
@@ -909,6 +914,44 @@ KPI_DESCRIPCION = {
     "Presupuestos":  "Negocios que entran en Facturas recibidas (LEAD)",
     "Clientes":      "Negocios que entran en Cierre ganado (LEAD)",
 }
+
+# Semanas comerciales:
+#   - Hasta el viernes 23/10/2026 a las 13:30: semanas del calendario, de lunes a domingo (como antes).
+#   - Desde el viernes 23/10/2026 a las 13:30: la semana se cierra el VIERNES a las 13:30; lo que pasa
+#     desde el viernes a las 13:30 hasta el lunes cuenta ya en la semana siguiente.
+# La Sem 43 es la de transición: del lunes 19/10 al viernes 23/10 a las 13:30.
+# Truco: a las fechas desde el cambio se les "adelanta" 2 días y 10 h 30 min (viernes 13:30 → lunes 00:00)
+# y se toma su semana del calendario.
+CAMBIO_CIERRE_VIERNES = pd.Timestamp("2026-10-23 13:30")
+DESPLAZ_SEMANA = pd.Timedelta(days=2, hours=10, minutes=30)
+
+def lunes_kpi(fechas):
+    """Lunes (00:00) que da nombre a la semana comercial de cada fecha (serie o fecha suelta)."""
+    if isinstance(fechas, pd.Series):
+        f = pd.to_datetime(fechas)
+        f = f.where(f < CAMBIO_CIERRE_VIERNES, f + DESPLAZ_SEMANA)
+        return (f - pd.to_timedelta(f.dt.weekday, unit="D")).dt.normalize()
+    f = pd.Timestamp(fechas)
+    if f >= CAMBIO_CIERRE_VIERNES:
+        f = f + DESPLAZ_SEMANA
+    return (f - pd.Timedelta(days=f.weekday())).normalize()
+
+def inicio_semana_kpi(lunes):
+    """Momento en que empieza la semana comercial que se nombra por ese lunes."""
+    lunes = pd.Timestamp(lunes)
+    ini = lunes - DESPLAZ_SEMANA
+    return ini if ini >= CAMBIO_CIERRE_VIERNES else lunes
+
+def texto_inicio(ini):
+    ini = pd.Timestamp(ini)
+    return f"viernes {ini.strftime('%d/%m')} a las 13:30" if ini.hour or ini.minute else f"lunes {ini.strftime('%d/%m')}"
+
+def texto_fin(fin):
+    """fin = último instante de la semana (… 13:29:59 del viernes o 23:59:59 del domingo)."""
+    e = pd.Timestamp(fin) + pd.Timedelta(microseconds=1)
+    if e.hour or e.minute:
+        return f"viernes {e.strftime('%d/%m')} a las 13:30"
+    return f"domingo {(e - pd.Timedelta(days=1)).strftime('%d/%m')} a las 23:59"
 
 def etiqueta_semana(fecha):
     """'Sem 41' según el calendario (semana ISO, empieza en lunes)."""
@@ -946,7 +989,7 @@ def solo_ultima_etapa_semana(ev, df_deals):
     entradas["deal_id"] = entradas["deal_id"].astype(str)
     entradas = entradas.melt(id_vars="deal_id", value_name="f").dropna(subset=["f"])
     entradas["f"] = pd.to_datetime(entradas["f"])
-    entradas["lunes"] = (entradas["f"] - pd.to_timedelta(entradas["f"].dt.weekday, unit="D")).dt.normalize()
+    entradas["lunes"] = lunes_kpi(entradas["f"])
     ultima = entradas.groupby(["deal_id", "lunes"])["f"].max()
     claves = list(zip(ev["deal_id"].astype(str), ev["lunes"]))
     ult = pd.Series([ultima.get(k, pd.NaT) for k in claves], index=ev.index)
@@ -991,9 +1034,9 @@ def kpi_eventos(df_lead, meetings_df=None):
         return pd.DataFrame(columns=["fecha", "kpi", "owner", "detalle", "semana", "lunes", "mes", "mes_inicio"])
     ev = pd.concat(partes, ignore_index=True)
     ev["fecha"]      = pd.to_datetime(ev["fecha"])
-    ev["lunes"]      = (ev["fecha"] - pd.to_timedelta(ev["fecha"].dt.weekday, unit="D")).dt.normalize()
+    ev["lunes"]      = lunes_kpi(ev["fecha"])
     ev = solo_ultima_etapa_semana(ev, df_lead)
-    ev["semana"]     = ev["fecha"].apply(etiqueta_semana)
+    ev["semana"]     = ev["lunes"].apply(etiqueta_semana)
     ev["mes_inicio"] = ev["fecha"].dt.to_period("M").dt.to_timestamp()
     ev["mes"]        = ev["mes_inicio"].apply(lambda d: f"{MESES_ES[d.month - 1]} {d.year}")
     return ev
@@ -1003,11 +1046,13 @@ def periodos_kpi(frecuencia, n_periodos, hoy):
     hoy = pd.Timestamp(hoy)
     out = []
     if frecuencia == "Semana":
-        lunes = (hoy - pd.Timedelta(days=hoy.weekday())).normalize()
+        # Semana comercial (ver CAMBIO_CIERRE_VIERNES)
+        lunes = lunes_kpi(hoy)
         for i in range(n_periodos - 1, -1, -1):
-            ini = lunes - pd.Timedelta(weeks=i)
-            fin = ini + pd.Timedelta(days=7) - pd.Timedelta(microseconds=1)
-            out.append((f"{etiqueta_semana(ini)} · {ini.strftime('%d/%m')}", ini, fin))
+            lun = lunes - pd.Timedelta(weeks=i)
+            ini = inicio_semana_kpi(lun)
+            fin = inicio_semana_kpi(lun + pd.Timedelta(weeks=1)) - pd.Timedelta(microseconds=1)
+            out.append((f"{etiqueta_semana(lun)} · {lun.strftime('%d/%m')}", ini, fin))
     else:
         primero = hoy.normalize().replace(day=1)
         for i in range(n_periodos - 1, -1, -1):
@@ -1175,7 +1220,7 @@ def excel_kpis(eventos, periodos_sem, periodos_mes, titulo_rango):
 
     # Definiciones
     ws = wb.create_sheet("Definiciones")
-    _cabecera(ws, "Qué cuenta cada KPI", f"Semanas según calendario (lunes a domingo). No incluye los movimientos en bloque del {pd.Timestamp(MIGRACION_DIA).strftime('%d/%m/%Y')}.", ["KPI", "Qué cuenta"])
+    _cabecera(ws, "Qué cuenta cada KPI", f"Semanas de lunes a domingo hasta el 23/10/2026 a las 13:30; desde entonces, del viernes a las 13:30 al viernes siguiente a las 13:30. No incluye los movimientos en bloque del {pd.Timestamp(MIGRACION_DIA).strftime('%d/%m/%Y')}.", ["KPI", "Qué cuenta"])
     for i, k in enumerate(KPI_ORDEN, start=5):
         ws.cell(row=i, column=1, value=k)
         ws.cell(row=i, column=2, value=KPI_DESCRIPCION[k])
@@ -2200,9 +2245,10 @@ tabs = st.tabs([
 KPIS_SEMANA = ["Visitas", "Presupuestos", "Clientes"]
 
 with tabs[0]:
-    lunes_hoy   = (pd.Timestamp(today) - pd.Timedelta(days=today.weekday())).normalize()
+    lunes_hoy   = lunes_kpi(today)
     semana_hoy  = etiqueta_semana(lunes_hoy)
-    st.subheader(f"📋 Esta semana — {semana_hoy} (desde el lunes {lunes_hoy.strftime('%d/%m')})")
+    inicio_hoy  = inicio_semana_kpi(lunes_hoy)
+    st.subheader(f"📋 Esta semana — {semana_hoy} (desde el {texto_inicio(inicio_hoy)})")
 
     pipe_nombre = st.radio("Pipeline", ["LEAD", "CLIENTES"], horizontal=True, key="esta_pipe")
     pipe_id   = LEAD_PIPELINE_ID if pipe_nombre == "LEAD" else "default"
@@ -2230,7 +2276,7 @@ with tabs[0]:
         semanas_sel = periodos_kpi("Semana", 8, today)[::-1]
         def _nombre_sem(i):
             etq, ini, fin = semanas_sel[i]
-            txt = f"{etq.split(' · ')[0]} ({ini.strftime('%d/%m')} – {fin.strftime('%d/%m')})"
+            txt = f"{etq.split(' · ')[0]} ({texto_inicio(ini)} – {texto_fin(fin)})"
             return txt + " · en curso" if i == 0 else txt
         i_sem = st.selectbox("Semana", list(range(len(semanas_sel))), format_func=_nombre_sem,
                              key=f"sem_t1_{pipe_nombre}")
@@ -2238,6 +2284,8 @@ with tabs[0]:
         sem_sel   = semanas_sel[i_sem][0].split(" · ")[0]
         ini_sel, fin_sel = semanas_sel[i_sem][1], semanas_sel[i_sem][2]
         ev_semana = eventos[(eventos["fecha"] >= ini_sel) & (eventos["fecha"] <= fin_sel)]
+        # Cierre de la semana: el último instante de la semana (domingo 23:59 o viernes 13:30)
+        cierre_sel = fin_sel
         cupo_df, _sel, _reu, _desc = cupo_semanal(
             df_tab, lunes_hoy.to_pydatetime(), today, today, cupo_comercial, semanas_caducidad
         )
@@ -2245,14 +2293,18 @@ with tabs[0]:
             en_sel = dict(zip(cupo_df["owner"], cupo_df["en_seleccion"])) if not cupo_df.empty else {}
             sel_cierre = pd.DataFrame()
         else:
-            # Semana pasada: cuántos tenía cada comercial en Selección el domingo a las 23:59,
+            # Semana pasada: cuántos tenía cada comercial en Selección al cierre de la semana,
             # reconstruido con el historial de etapas de los negocios que han pasado por Selección
-            candidatos = df_tab[df_tab["f_seleccion"].notna()]
-            ids_cierre = set()
+            # 1) Los que siguen hoy en Selección y ya estaban antes del cierre: seguro que estaban.
+            sigue_sel = (df_tab["dealstage"].isin(SELECCION_IDS)
+                         & df_tab["f_etapa_actual"].notna() & (df_tab["f_etapa_actual"] <= cierre_sel))
+            ids_cierre = set(df_tab.loc[sigue_sel, "deal_id"].astype(str))
+            # 2) Los que han pasado por Selección pero ya no están: se mira su historial.
+            candidatos = df_tab[df_tab["f_seleccion"].notna() & ~sigue_sel]
             if not candidatos.empty:
                 with st.spinner("Reconstruyendo cómo estaba cada comercial al cierre de la semana..."):
                     hist = cached_stage_history(api_key, tuple(sorted(candidatos["deal_id"].astype(str))))
-                ids_cierre = en_seleccion_al_cierre(hist, SELECCION_IDS, fin_sel)
+                ids_cierre |= en_seleccion_al_cierre(hist, SELECCION_IDS, cierre_sel)
             sel_cierre = df_tab[df_tab["deal_id"].astype(str).isin(ids_cierre)]
             en_sel = sel_cierre.groupby("owner").size().to_dict()
 
@@ -2290,14 +2342,14 @@ with tabs[0]:
             )
         if es_actual:
             st.caption(
-                f"Visitas, presupuestos y clientes cuentan desde el lunes. "
+                f"Visitas, presupuestos y clientes cuentan desde el {texto_inicio(ini_sel)} hasta el {texto_fin(fin_sel)}. "
                 f"**Trabajando ahora** = negocios en Selección. "
                 f"**Huecos libres** = {cupo_comercial} − trabajando ahora: cuántos negocios nuevos se le pueden dar."
             )
         else:
             st.caption(
-                f"Visitas, presupuestos y clientes de la {sem_sel}, de lunes a domingo. "
-                f"**Trabajando al cierre** = negocios que estaban en Selección el domingo {fin_sel.strftime('%d/%m')} a las 23:59. "
+                f"Visitas, presupuestos y clientes de la {sem_sel}: del {texto_inicio(ini_sel)} al {texto_fin(fin_sel)}. "
+                f"**Trabajando al cierre** = negocios que estaban en Selección el {texto_fin(cierre_sel)}. "
                 f"**Huecos libres al cierre** = {cupo_comercial} − trabajando al cierre."
             )
 
@@ -2313,7 +2365,7 @@ with tabs[0]:
                     st.markdown(f"**Trabajando ahora ({len(sel_c)})** — están en la etapa Selección")
                 else:
                     cierre_c = sel_cierre[sel_cierre["owner"] == com] if not sel_cierre.empty else sel_cierre
-                    st.markdown(f"**Trabajando al cierre ({len(cierre_c)})** — estaban en Selección el domingo {fin_sel.strftime('%d/%m')}")
+                    st.markdown(f"**Trabajando al cierre ({len(cierre_c)})** — estaban en Selección el {texto_fin(cierre_sel)}")
                     if cierre_c.empty:
                         st.caption("No tenía negocios en Selección al cierre de esa semana.")
                     else:
@@ -2338,7 +2390,7 @@ with tabs[0]:
                 # 2) Visitas, presupuestos y clientes de esta semana
                 ev_c = ev_semana[(ev_semana["owner"] == com) & ev_semana["kpi"].isin(KPIS_SEMANA)].sort_values("fecha")
                 st.markdown(f"**{sem_sel} ({len(ev_c)})** — visitas, presupuestos y clientes"
-                            + (" desde el lunes" if es_actual else ""))
+                            + (f" desde el {texto_inicio(ini_sel)}" if es_actual else ""))
                 if ev_c.empty:
                     st.caption("No ha sumado visitas, presupuestos ni clientes en esta semana.")
                 else:
