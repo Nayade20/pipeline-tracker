@@ -2250,17 +2250,30 @@ with tabs[0]:
     inicio_hoy  = inicio_semana_kpi(lunes_hoy)
     st.subheader(f"📋 Esta semana — {semana_hoy} (desde el {texto_inicio(inicio_hoy)})")
 
-    pipe_nombre = st.radio("Pipeline", ["LEAD", "CLIENTES"], horizontal=True, key="esta_pipe")
-    pipe_id   = LEAD_PIPELINE_ID if pipe_nombre == "LEAD" else "default"
-    ids_pipe  = STAGE_MAP.get(pipe_id, {})
-    df_tab    = df_kpi_base[df_kpi_base["pipeline_id"] == pipe_id].copy()
-    nom_etapa = lambda col: STAGE_LABELS.get(ids_pipe.get(col) or "", "—")
-    faltan    = [n for col, n in [("f_seleccion", "Selección"), ("f_reunion", "Reunión"),
-                                  ("f_presupuesto", "Facturas recibidas"), ("f_ganado", "ganado")]
-                 if not ids_pipe.get(col)]
-    if faltan:
-        st.warning(f"No encuentro en HubSpot estas etapas del pipeline {pipe_nombre}: {', '.join(faltan)}. "
-                   f"Revisa que se llamen así o avisa para ajustarlo.")
+    # Pipelines: los elegidos en "Filtrar pipeline" de la barra lateral (LEAD primero).
+    # Si están los dos, las cifras suman LEAD + CLIENTES.
+    pipes_tab = [pid for pid in [LEAD_PIPELINE_ID, "default"]
+                 if not pipeline_filter or PIPELINE_NAMES.get(pid) in pipeline_filter]
+    pipe_nombre = " + ".join(PIPELINE_NAMES[p] for p in pipes_tab)
+    st.markdown(f"**Pipeline:** {pipe_nombre} "
+                f"<span style='color:gray'>(se cambia en «Filtrar pipeline» de la barra lateral)</span>",
+                unsafe_allow_html=True)
+    df_tab    = df_kpi_base[df_kpi_base["pipeline_id"].isin(pipes_tab)].copy()
+    pipe_de   = dict(zip(df_tab["deal_id"].astype(str), df_tab["pipeline_id"]))
+    COL_KPI   = {"Visitas": "f_reunion", "Presupuestos": "f_presupuesto", "Clientes": "f_ganado"}
+    def nom_etapa(col, pid):
+        return STAGE_LABELS.get(STAGE_MAP.get(pid, {}).get(col) or "", "—")
+    def motivo_ev(ev):
+        """'Entró en <etapa>' según el KPI y el pipeline de cada negocio."""
+        return [f"Entró en {nom_etapa(COL_KPI.get(k, ''), pipe_de.get(str(d), ''))}"
+                for k, d in zip(ev["kpi"], ev["deal_id"])]
+    for _pid in pipes_tab:
+        faltan = [n for col, n in [("f_seleccion", "Selección"), ("f_reunion", "Reunión"),
+                                   ("f_presupuesto", "Facturas recibidas"), ("f_ganado", "ganado")]
+                  if not STAGE_MAP.get(_pid, {}).get(col)]
+        if faltan:
+            st.warning(f"No encuentro en HubSpot estas etapas del pipeline {PIPELINE_NAMES[_pid]}: {', '.join(faltan)}. "
+                       f"Revisa que se llamen así o avisa para ajustarlo.")
     if st.session_state.get("_pipelines_error"):
         st.warning(f"No se han podido leer los pipelines de HubSpot: {st.session_state['_pipelines_error']}")
 
@@ -2292,6 +2305,7 @@ with tabs[0]:
         if es_actual:
             en_sel = dict(zip(cupo_df["owner"], cupo_df["en_seleccion"])) if not cupo_df.empty else {}
             sel_cierre = pd.DataFrame()
+            en_sel_pp = df_tab[df_tab["dealstage"].isin(SELECCION_IDS)].groupby(["owner", "pipeline_id"]).size().to_dict()
         else:
             # Semana pasada: cuántos tenía cada comercial en Selección al cierre de la semana,
             # reconstruido con el historial de etapas de los negocios que han pasado por Selección
@@ -2307,6 +2321,7 @@ with tabs[0]:
                 ids_cierre |= en_seleccion_al_cierre(hist, SELECCION_IDS, cierre_sel)
             sel_cierre = df_tab[df_tab["deal_id"].astype(str).isin(ids_cierre)]
             en_sel = sel_cierre.groupby("owner").size().to_dict()
+            en_sel_pp = sel_cierre.groupby(["owner", "pipeline_id"]).size().to_dict()
 
         owners_t1 = sorted(set(en_sel) | set(ev_semana.loc[ev_semana["kpi"].isin(KPIS_SEMANA), "owner"]))
 
@@ -2323,7 +2338,8 @@ with tabs[0]:
                 "Visitas":          int((ev_o["kpi"] == "Visitas").sum()),
                 "Presupuestos":     int((ev_o["kpi"] == "Presupuestos").sum()),
                 "Clientes":         int((ev_o["kpi"] == "Clientes").sum()),
-                col_huec:           max(cupo_comercial - n_sel, 0),
+                # Cupo de 20 por pipeline: con LEAD + CLIENTES se suman los huecos de cada uno
+                col_huec:           sum(max(cupo_comercial - int(en_sel_pp.get((o, _p), 0)), 0) for _p in pipes_tab),
             })
         tabla1 = pd.DataFrame(filas)[cols_t1] if filas else pd.DataFrame(columns=cols_t1)
         if tabla1.empty:
@@ -2344,13 +2360,15 @@ with tabs[0]:
             st.caption(
                 f"Visitas, presupuestos y clientes cuentan desde el {texto_inicio(ini_sel)} hasta el {texto_fin(fin_sel)}. "
                 f"**Trabajando ahora** = negocios en Selección. "
-                f"**Huecos libres** = {cupo_comercial} − trabajando ahora: cuántos negocios nuevos se le pueden dar."
+                f"**Huecos libres** = {cupo_comercial} − trabajando ahora: cuántos negocios nuevos se le pueden dar"
+                + (" (cupo de 20 en cada pipeline; se suman los huecos de LEAD y CLIENTES)." if len(pipes_tab) > 1 else ".")
             )
         else:
             st.caption(
                 f"Visitas, presupuestos y clientes de la {sem_sel}: del {texto_inicio(ini_sel)} al {texto_fin(fin_sel)}. "
                 f"**Trabajando al cierre** = negocios que estaban en Selección el {texto_fin(cierre_sel)}. "
-                f"**Huecos libres al cierre** = {cupo_comercial} − trabajando al cierre."
+                f"**Huecos libres al cierre** = {cupo_comercial} − trabajando al cierre"
+                + (" (cupo de 20 en cada pipeline; se suman los huecos de LEAD y CLIENTES)." if len(pipes_tab) > 1 else ".")
             )
 
         # ── Qué negocios tiene cada comercial y por qué cuentan ──
@@ -2394,15 +2412,11 @@ with tabs[0]:
                 if ev_c.empty:
                     st.caption("No ha sumado visitas, presupuestos ni clientes en esta semana.")
                 else:
-                    motivo = {
-                        "Visitas":      f"Entró en {nom_etapa('f_reunion')}",
-                        "Presupuestos": f"Entró en {nom_etapa('f_presupuesto')}",
-                        "Clientes":     f"Entró en {nom_etapa('f_ganado')}",
-                    }
                     st.dataframe(pd.DataFrame({
                         "KPI":          ev_c["kpi"],
                         "Negocio":      ev_c["detalle"],
-                        "Por qué cuenta": ev_c["kpi"].map(motivo) + " el " + ev_c["fecha"].dt.strftime("%d/%m"),
+                        "Pipeline":     ev_c["deal_id"].astype(str).map(pipe_de).map(PIPELINE_NAMES).fillna("—"),
+                        "Por qué cuenta": pd.Series(motivo_ev(ev_c), index=ev_c.index) + " el " + ev_c["fecha"].dt.strftime("%d/%m"),
                         "Etapa actual": ev_c["deal_id"].map(etapa_hoy).map(STAGE_LABELS).fillna("—"),
                     }), hide_index=True, use_container_width=True)
 
@@ -2413,12 +2427,15 @@ with tabs[0]:
         tabla2.columns = [c.split(" · ")[0] for c in tabla2.columns]
         st.dataframe(tabla2, use_container_width=True)
         st.caption(
-            f"Pipeline {pipe_nombre}: **Visitas** = entran en *{nom_etapa('f_reunion')}* · "
-            f"**Presupuestos** = entran en *{nom_etapa('f_presupuesto')}* · "
-            f"**Clientes** = entran en *{nom_etapa('f_ganado')}*. "
-            f"La columna {semana_hoy} es la semana en curso. "
-            f"No cuentan como visitas los negocios movidos en bloque a Reunión el día de la reorganización "
-            f"({pd.Timestamp(PIPE_CONFIG[pipe_id]['migracion']).strftime('%d/%m/%Y')})."
+            " ".join(
+                f"Pipeline {PIPELINE_NAMES[_pid]}: **Visitas** = entran en *{nom_etapa('f_reunion', _pid)}* · "
+                f"**Presupuestos** = entran en *{nom_etapa('f_presupuesto', _pid)}* · "
+                f"**Clientes** = entran en *{nom_etapa('f_ganado', _pid)}*."
+                for _pid in pipes_tab)
+            + f" La columna {semana_hoy} es la semana en curso. "
+            f"No cuentan como visitas los negocios movidos en bloque a Reunión el día de la reorganización ("
+            + ", ".join(f"{PIPELINE_NAMES[_pid]} {pd.Timestamp(PIPE_CONFIG.get(_pid, PIPE_CONFIG['default'])['migracion']).strftime('%d/%m/%Y')}"
+                        for _pid in pipes_tab) + ")."
         )
 
         # ── Qué negocios hay detrás de cada número ──
@@ -2435,6 +2452,7 @@ with tabs[0]:
             "Fecha":        det["fecha"].dt.strftime("%d/%m/%Y"),
             "KPI":          det["kpi"],
             "Negocio":      det["detalle"],
+            "Pipeline":     det["deal_id"].astype(str).map(pipe_de).map(PIPELINE_NAMES).fillna("—"),
             "Comercial":    det["owner"],
             "Etapa actual": det["etapa"],
         })
@@ -2459,42 +2477,44 @@ with tabs[0]:
         st.download_button(
             "⬇️ Descargar en Excel",
             data=excel_semana(tabla1, tabla2, f"{sem_sel} · {pipe_nombre}", today, detalle_df),
-            file_name=f"Seguimiento_semanal_{pipe_nombre}_{sem_sel.replace(' ', '')}_{today.strftime('%Y%m%d')}.xlsx",
+            file_name=f"Seguimiento_semanal_{pipe_nombre.replace(' + ', '_')}_{sem_sel.replace(' ', '')}_{today.strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
     # ── Comprobar qué papel tiene cada etapa de HubSpot en la app ──
-    with st.expander(f"🔧 Comprobar etapas del pipeline {pipe_nombre}"):
-        st.caption("Lista de las etapas que tiene ahora este pipeline en HubSpot y para qué las usa la app. "
-                   "Sirve para comprobar que, tras cambiar etapas, cada una cuenta donde debe.")
-        papeles = {}
-        for col, papel in [("f_bbdd", "BBDD: reserva, fuera de actividad y estancados"),
-                           ("f_seleccion", "Selección: cupo (Trabajando / Huecos libres)"),
-                           ("f_reunion", "Visitas"),
-                           ("f_presupuesto", "Presupuestos"),
-                           ("f_ganado", "Clientes")]:
-            if ids_pipe.get(col):
-                papeles[ids_pipe[col]] = papel
-        cuenta = df_kpi_base[df_kpi_base["pipeline_id"] == pipe_id].groupby("dealstage").size()
-        filas_d = []
-        for sid, nombre, *_ in _pipes.get(pipe_id, []):
-            papel = papeles.get(sid, "")
-            if sid in WON_STAGES:
-                papel = (papel + " · " if papel else "") + "Cerrada (ganada)"
-            elif sid in CLOSED_STAGES:
-                papel = (papel + " · " if papel else "") + "Cerrada (no cuenta como abierta)"
-            filas_d.append({"Etapa en HubSpot": nombre, "Nombre en la app": STAGE_LABELS.get(sid, sid),
-                            "Papel en la app": papel or "Abierta", "Negocios ahora": int(cuenta.get(sid, 0)),
-                            "ID": sid})
-        if filas_d:
-            st.dataframe(pd.DataFrame(filas_d), hide_index=True, use_container_width=True)
-        else:
-            st.warning("No se han podido leer las etapas de este pipeline en HubSpot.")
-        ids_hs = {sid for sid, *_ in _pipes.get(pipe_id, [])}
-        huerfanos = {sid: n for sid, n in cuenta.items() if ids_hs and sid not in ids_hs}
-        if huerfanos:
-            st.warning("Hay negocios en etapas que ya no existen en HubSpot: "
-                       + ", ".join(f"{STAGE_LABELS.get(k, k)} ({v})" for k, v in huerfanos.items()))
+    for pipe_id in pipes_tab:
+      ids_pipe = STAGE_MAP.get(pipe_id, {})
+      with st.expander(f"🔧 Comprobar etapas del pipeline {PIPELINE_NAMES[pipe_id]}"):
+          st.caption("Lista de las etapas que tiene ahora este pipeline en HubSpot y para qué las usa la app. "
+                     "Sirve para comprobar que, tras cambiar etapas, cada una cuenta donde debe.")
+          papeles = {}
+          for col, papel in [("f_bbdd", "BBDD: reserva, fuera de actividad y estancados"),
+                             ("f_seleccion", "Selección: cupo (Trabajando / Huecos libres)"),
+                             ("f_reunion", "Visitas"),
+                             ("f_presupuesto", "Presupuestos"),
+                             ("f_ganado", "Clientes")]:
+              if ids_pipe.get(col):
+                  papeles[ids_pipe[col]] = papel
+          cuenta = df_kpi_base[df_kpi_base["pipeline_id"] == pipe_id].groupby("dealstage").size()
+          filas_d = []
+          for sid, nombre, *_ in _pipes.get(pipe_id, []):
+              papel = papeles.get(sid, "")
+              if sid in WON_STAGES:
+                  papel = (papel + " · " if papel else "") + "Cerrada (ganada)"
+              elif sid in CLOSED_STAGES:
+                  papel = (papel + " · " if papel else "") + "Cerrada (no cuenta como abierta)"
+              filas_d.append({"Etapa en HubSpot": nombre, "Nombre en la app": STAGE_LABELS.get(sid, sid),
+                              "Papel en la app": papel or "Abierta", "Negocios ahora": int(cuenta.get(sid, 0)),
+                              "ID": sid})
+          if filas_d:
+              st.dataframe(pd.DataFrame(filas_d), hide_index=True, use_container_width=True)
+          else:
+              st.warning("No se han podido leer las etapas de este pipeline en HubSpot.")
+          ids_hs = {sid for sid, *_ in _pipes.get(pipe_id, [])}
+          huerfanos = {sid: n for sid, n in cuenta.items() if ids_hs and sid not in ids_hs}
+          if huerfanos:
+              st.warning("Hay negocios en etapas que ya no existen en HubSpot: "
+                         + ", ".join(f"{STAGE_LABELS.get(k, k)} ({v})" for k, v in huerfanos.items()))
 
 # ── TAB 1: COMERCIALES ─────────────────────────
 
